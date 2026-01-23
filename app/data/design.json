@@ -1,0 +1,1690 @@
+[
+  {
+    "id": "design-inference",
+    "title": "Multi-tenant inference gateway",
+    "topic": "AI infrastructure",
+    "minutes": 60,
+    "statement": "Design the request path for a hosted text-generation service used by around 100,000 organizations. Clients post a prompt to one public API. The gateway decides whether to accept the request, routes it to a pool of GPU model workers, and streams generated tokens back as they are produced. The workers themselves are given to you: your job is everything in front of them, namely admission control, routing, streaming, per-tenant quotas, and the accounting that has to survive a request to its end.",
+    "assumptions": [
+      "About 100,000 organizations share the service, with peaks near 20,000 requests per second across all of them.",
+      "A typical request carries roughly 1,000 input tokens and expects roughly 500 output tokens. Model execution is provided; you are not designing the inference runtime.",
+      "p95 time to first token must stay under 2 seconds. Once streaming begins, a response may run for up to 60 seconds.",
+      "Interactive and batch traffic share the same fleet but must not starve each other.",
+      "Per-tenant quotas, request cancellation, and durable usage accounting are all in scope."
+    ],
+    "probes": [
+      {
+        "section": "estimates",
+        "question": "How do you measure admission load when requests have unknown output length?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "Trace client disconnect through gateway, queue, worker and billing.",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "ops",
+        "question": "How do you roll out a model version without mixing incompatible caches?",
+        "difficulty": "Medium"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "A GPU pool loses 30% of capacity."
+      },
+      {
+        "section": "estimates",
+        "scenario": "One tenant sends 40% of all traffic."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names the client-facing operations: submit a prompt, stream tokens back, report on or cancel an in-flight request.",
+          "Treats per-tenant quota and durable usage accounting as functional requirements rather than later additions.",
+          "Puts model execution and training out of scope, and separates interactive traffic from batch traffic as distinct classes."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Derives input and output token throughput separately, declares worker-throughput assumptions, and distinguishes prefill cost, decode capacity and latency headroom.",
+          "Sizes admission and queueing in tokens of work, not in requests, because output length is unknown when the request arrives.",
+          "Splits the 20,000 requests per second peak into the interactive share that owes a 2 second time-to-first-token and the batch share that can wait."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Names tenant, quota state, request and usage record as separate entities, and says which of them must be durable.",
+          "Uses a client-supplied idempotency key so a retried submit returns the original request instead of starting a second one.",
+          "Keeps connection and stream state in a short-lived store, and states what must survive a gateway restart."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks the streaming path in order: authenticate, check quota, admit against a token budget, queue, schedule to a worker, stream tokens, then account.",
+          "Traces a second path explicitly, such as a cancelled or disconnected request, and says how it is detected and propagated.",
+          "Explains how the scheduler picks a worker and what happens when no decode slot is free."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Meets a 30% capacity loss by reducing admitted work to match, shedding with retry guidance instead of queueing without bound, and letting batch yield to interactive.",
+          "Keeps per-tenant fairness when one tenant sends 40% of traffic, through weighted scheduling or reserved capacity rather than arrival order.",
+          "Treats cancellation and mid-stream failure as explicit states with an idempotent usage record, rather than assuming a retry is free."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Reports time to first token and completion latency separately, because they have different objectives and different failure modes.",
+          "Names the saturation signals that should trigger action, such as queue depth measured in tokens and decode slot utilisation.",
+          "Pins a model version per request, canaries a new one, keeps the old pool for in-flight work, and invalidates caches that are not compatible."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-jobs",
+    "title": "Durable job execution platform",
+    "topic": "Distributed systems",
+    "minutes": 60,
+    "statement": "Clients submit long-running work and expect exactly two things: that submitting it is fast, and that nothing they were told was accepted is ever silently lost. They come back later to check status and collect results. Execution itself may take a second or half an hour and may reach out to other systems along the way, so the hard part is not running the work but surviving everything that happens around it.",
+    "assumptions": [
+      "About 10 million jobs a day, with bursts up to ten times the average rate.",
+      "A job runs for anywhere from 1 second to 30 minutes, and may have side effects on other systems while it does.",
+      "Submission has a p99 under 200ms, which is a durable write and an acknowledgement rather than the work itself.",
+      "No job that has been accepted may be lost, including through a worker crash, a deploy, or a rolling restart.",
+      "Jobs carry priorities, can be cancelled before they start, and must not leak between tenants."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "What durable action makes a submission accepted?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "failure",
+        "question": "A worker finishes its side effect then crashes before acknowledging. What happens?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "failure",
+        "question": "How do leases prevent an old worker from overwriting a new attempt?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "flow",
+        "scenario": "Queue unavailable for five minutes."
+      },
+      {
+        "section": "failure",
+        "scenario": "A poison job fails forever."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names submit, status, result retrieval and cancel as the client-facing operations, and says who is allowed to cancel.",
+          "States the durability promise for an accepted job as at-least-once execution with a retrievable result, rather than claiming exactly-once.",
+          "Says what is out of scope, such as the compute substrate the workers run on."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Derives a submission rate from the daily job count and observes that a 200ms submission p99 is a write plus an acknowledgement, not the job itself.",
+          "Declares a duration distribution or mean before using arrival rate times runtime to size worker concurrency; explains sensitivity to long-running jobs and burst duration.",
+          "Identifies queue age or pending work as the first thing to saturate as arrival rate climbs."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Separates job, attempt and result into their own records, with an attempt carrying its own state rather than mutating the job.",
+          "Gives the job and each attempt a durable identifier, so a redelivered job is recognisable as the same one.",
+          "Stores the enqueue decision in the same durable transaction as the submission, so a job cannot be accepted and never queued."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks submit as validate, atomically commit job plus outbox intent, then acknowledge; broker publication is an asynchronous dispatcher action after commit and may repeat.",
+          "Walks completion as store an immutable result, conditionally commit result pointer and terminal state with the current lease epoch while clearing the lease, then acknowledge the broker.",
+          "Says how a client learns the job finished, whether by polling, webhook or stream, and what it receives."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles side-effect completion followed by a crash using a stable logical-effect idempotency key reused across attempts, or reconciliation for an ambiguous downstream system; never claims queue acknowledgement makes external effects exactly once.",
+          "Uses a fencing token or lease epoch, so a worker that stalled past its lease cannot overwrite the result of a newer attempt.",
+          "Handles a queue outage by keeping accepted jobs durable and letting workers drain, rather than rejecting work that was already acknowledged."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Names the metrics that matter: queue age, attempt rate, poison job count, and end-to-end latency by job class.",
+          "Describes backpressure and a dead-letter path, including how a poison job is isolated and surfaced instead of blocking the queue.",
+          "Says how a stuck job is detected and reconciled, and how a dead worker is told apart from a slow job."
+        ]
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "design-chat",
+    "title": "Team messaging service",
+    "topic": "Real-time systems",
+    "minutes": 60,
+    "statement": "A team messaging service has to do two jobs that pull against each other. History has to be durable and complete enough to search, and delivery to the people currently online has to feel immediate. Getting the history right is easy to fail in one direction, and getting live delivery right is easy to fail in the other.",
+    "assumptions": [
+      "10 million daily active users, of whom about 1 million hold a connection open at any moment.",
+      "100 million messages a day, averaging 1KB each before attachments.",
+      "Messages within a channel are totally ordered, history is durable, and online delivery has a p95 under 300ms.",
+      "Some channels have 100,000 members, so delivering to a busy channel is a broadcast problem rather than a fan-out to individuals."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "Where is message order assigned and what does it guarantee?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "flow",
+        "question": "How does an offline client resume without gaps?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "ops",
+        "question": "How does search enforce channel membership changes?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "scope",
+        "question": "The interviewer says: build the Slack MVP in two weeks with two engineers. What do you cut first, and what is week three?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "estimates",
+        "question": "The interviewer says: 100x, then 1000x. Redo the estimates and say which assumption breaks first.",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "data",
+        "scenario": "A hot channel exceeds one partition capacity."
+      },
+      {
+        "section": "failure",
+        "scenario": "A reconnect storm follows a regional network outage."
+      },
+      {
+        "section": "flow",
+        "scenario": "One channel has 1,000,000 members and receives 100 messages a second."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names channels, direct messages, history retrieval, search and presence as distinct user-facing behaviours.",
+          "States per-channel ordering and durable history as requirements, and keeps them distinct from the best-effort online delivery objective.",
+          "Puts something out of scope, and treats attachments as object references rather than message payloads."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 100 million messages a day into a per-second write rate, and reasons per channel rather than only on the global total.",
+          "Treats a 100,000 member channel as a fan-out problem and works out how many delivery events one message creates.",
+          "Sizes history storage from volume and retention, and says what the read path does instead of scanning it."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Names channel, message and membership as entities, and gives each message a channel-scoped sequence number that defines its order.",
+          "Records a delivery cursor per connection, so resume is a read from a known point rather than a replay from the beginning.",
+          "Keeps presence as ephemeral and history as durable, and says which store holds which."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks send as authorize membership, assign the channel sequence, persist, then fan out to online members.",
+          "Walks the resume path as: client presents its last sequence, server replays the gap from the log, then returns to live.",
+          "Describes search reaching only the channels a member can see, and applies that filter before ranking."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Scales hot-channel fanout and physical history partitions while retaining one fenced logical order authority; explains batching, isolation or backpressure if sequencing saturates instead of assuming independent writers preserve total order.",
+          "Handles a reconnect storm by staggering reconnection with jitter and backoff, and by serving history from the log rather than live fan-out.",
+          "Handles a membership change by authorising at read time, so a removed member loses access to history they could previously fetch."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Names the metrics: send latency, fan-out lag, connection count, and the rate of resumes that find a cursor gap.",
+          "Describes what happens when a channel is archived or deleted, and how attachments and search entries are handled.",
+          "Says how a new member is given history, by backfill on join or by reading the log up to the join point."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-limits",
+    "title": "Global rate limiting service",
+    "topic": "Consistency & availability",
+    "minutes": 60,
+    "statement": "Before any API call is served, something has to answer one question: is this caller within its allowance right now? The answer has to come from somewhere close enough to the caller to stay off the critical path, and still be consistent enough that an organization cannot spend the same quota twice by spreading its traffic across regions.",
+    "assumptions": [
+      "1 million limit decisions per second worldwide, spread across three regions.",
+      "The limiter may add under 5ms at p99 to a request handled within its own region.",
+      "Traffic is shaped by both a burst allowance and a sustained token budget, and the two have to be enforced together rather than independently.",
+      "Hard billing quotas must never be exceeded. Abuse-protection limits may tolerate roughly 1% overshoot, because refusing a legitimate request costs more than briefly admitting a bad one."
+    ],
+    "probes": [
+      {
+        "section": "scope",
+        "question": "Which limits require strict correctness and which can be approximate?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "failure",
+        "question": "What happens during a partition between regions?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "How do you change a quota while requests are in flight?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "A central counter shard is unavailable."
+      },
+      {
+        "section": "data",
+        "scenario": "Traffic concentrates on a single organization key."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Separates hard billing quotas from abuse-protection limits, and says only the first may never be exceeded.",
+          "Names the decision interface: a quota key, a cost, and an allow or deny result that the caller blocks on or throttles against.",
+          "Says what is out of scope, such as enforcement inside the customer's own service."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Derives regional decision rates and shard capacity assumptions, and keeps the hot path regional with an atomic local check rather than a cross-region round trip.",
+          "Reasons from the 5ms added latency budget about what it rules out, such as a cross-region round trip per decision.",
+          "Sizes the live state by distinct quota keys and maps that onto shards."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Names the quota record: key, limit, window or budget, remaining, and the window boundaries.",
+          "States the update as atomic, so two concurrent requests cannot both be admitted against the same last unit of quota.",
+          "Separates the policy record from the counter, so changing a quota does not require rewriting in-flight state."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks a decision as identify the quota key, read local or regional state, apply the rule, and return without a global write when possible.",
+          "Describes how a region leases tokens and replenishes them, and why that keeps the hot path local.",
+          "Defines the effective boundary of a quota reduction, accounts already accepted reservations, and drains or fences old grants before claiming global enforcement; exposes pending updates under partitions."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Uses only durable preallocated rights for hard quotas during outages and denies when rights cannot be proved or are exhausted; approximate abuse fallback has an explicit finite overshoot budget.",
+          "Accounts outstanding hard-quota grants as reserved entitlement and never reissues disconnected rights without safe fencing; sizes approximate overshoot against the actual key and window.",
+          "Handles a hot single-organization key by splitting its budget across shards or leases, rather than serialising on one counter."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Names the metrics: decision rate, allow ratio, overshoot against hard quotas, and the per-region lease deficit.",
+          "States the clock assumption and how skew between client and limiter is prevented from granting extra quota.",
+          "Says how a limit change is audited and rolled back, and how a customer sees their current usage."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-usage",
+    "title": "Usage metering and billing pipeline",
+    "topic": "Data pipelines",
+    "minutes": 60,
+    "statement": "Usage arrives as a firehose of events that has to become an invoice a customer will actually accept. This pipeline is judged on two things that pull against each other: the dashboard has to be close to live, and the monthly bill has to be exactly reproducible months later, including every correction applied along the way.",
+    "assumptions": [
+      "2 billion events a day, averaging 300 bytes each.",
+      "Duplicates and out-of-order delivery are normal, and an event can arrive up to 72 hours late.",
+      "Dashboards are expected to be under a minute behind. Invoices must be auditable line by line.",
+      "Pricing changes over time, so an event priced months later is still charged at the rate that applied when it happened.",
+      "Corrections, refunds and credits all have to flow through without rewriting the underlying history."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "How do you deduplicate without losing legitimate retries?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "failure",
+        "question": "What happens when a late event arrives after invoice close?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "data",
+        "question": "Which price version applies to a delayed usage event?",
+        "difficulty": "Medium"
+      }
+    ],
+    "failures": [
+      {
+        "section": "flow",
+        "scenario": "An upstream bug emits tenfold duplicate traffic."
+      },
+      {
+        "section": "failure",
+        "scenario": "A month of usage must be recomputed under corrected pricing."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names the three consumers with different needs: near-live dashboards, auditable invoices, and customer-facing usage queries.",
+          "Treats corrections, refunds and credits as first-class outputs that flow through the pipeline rather than as manual adjustments.",
+          "Says what is out of scope, such as the products that emit the events, and states that an event priced months later is charged at the rate that applied when it happened."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 2 billion events a day into a sustained per-second rate and multiplies by event size to get daily volume.",
+          "Reasons about how the 72 hour lateness window sizes the state that must be held open before an aggregate can be called final.",
+          "Says which is the real constraint: write throughput, storage for the retention period, or the cost of recomputing a closed month."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Keeps the raw event ledger immutable and append-only, so a correction is a new record rather than an edit.",
+          "Stores a versioned price snapshot and resolves which version applied from the event's own time, not from when it was processed.",
+          "Gives each event a deduplication identity that distinguishes a genuine second use from a redelivery of the same use."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks ingest as validate, deduplicate, attribute to a price version, and fold into a running aggregate keyed by event time rather than arrival time.",
+          "Walks the dashboard path separately from the billing path, and says why they are allowed to disagree for up to a minute.",
+          "Describes month close: freeze the aggregate, produce the invoice as an immutable artefact, and open a correction window after it."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles tenfold duplicate traffic by making deduplication cheap and by refusing to let a duplicate reach the balance, rather than by dropping events on the floor.",
+          "Handles recomputing a closed month by replaying the immutable ledger under the corrected price version and issuing a delta, never rewriting the original invoice.",
+          "States what happens to an event that arrives after its month closed, and how that is surfaced rather than silently dropped."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Describes reconciliation against upstream provider records, and what a mismatch means operationally.",
+          "Keeps an audit trail linking every invoice line back to the events that produced it, which is what makes a disputed bill answerable.",
+          "Separates estimated usage from final invoiced usage, and says how long the estimate is allowed to differ from the final figure."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-search",
+    "title": "Document ingestion and retrieval",
+    "topic": "Search & AI",
+    "minutes": 60,
+    "statement": "Users upload documents and then ask an assistant questions about them. The upload side is a pipeline that has to keep pace with a steady stream of changes, and the query side is a latency budget measured in a fraction of a second. Neither of those is the hardest requirement. The hardest is that deleting a document, or revoking access to it, has to take effect everywhere and immediately.",
+    "assumptions": [
+      "10 million documents and 100 million chunks, with about 20,000 uploads an hour.",
+      "Queries return in under 300ms at p95, excluding the time spent generating an answer.",
+      "A newly uploaded or updated document becomes visible to search within 5 minutes.",
+      "Deleting a document, or revoking a permission, must prevent any further retrieval of it. There is no grace period."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "How do you update a document without exposing a half-built index?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "How do authorization filters apply before results reach the model?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "ops",
+        "question": "How do you rebuild embeddings for a new model version?",
+        "difficulty": "Medium"
+      }
+    ],
+    "failures": [
+      {
+        "section": "ops",
+        "scenario": "Indexing backlog grows to six hours."
+      },
+      {
+        "section": "flow",
+        "scenario": "A deleted document remains in a cached retrieval result."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names upload, chunking, indexing, retrieval and deletion as the distinct stages, and says which are asynchronous.",
+          "Makes deletion and permission revocation a correctness requirement with no grace period, not a cleanup task.",
+          "Puts answer generation out of scope, and says the retrieval layer returns candidates plus their permissions."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 20,000 uploads an hour into a sustained ingestion rate and notes it is bursty rather than smooth.",
+          "Reasons about index size from 100 million chunks, and about what a 300ms p95 query budget actually permits for retrieval versus ranking.",
+          "Identifies embedding inference for new and changed documents as a capacity line item, not an afterthought."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Gives each chunk a stable identifier tied to its document and a document version, so a half-built index is never visible.",
+          "Stores the ACL alongside the document and versions the index, so an update publishes a new complete version rather than mutating in place.",
+          "Records the embedding model version with each vector, because a mixed index is silently wrong rather than loudly broken."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks ingestion as store the object, parse asynchronously, chunk, embed, index into lexical and vector stores, then mark the new version visible.",
+          "Walks the query path as authorise, retrieve candidates, apply the ACL filter before ranking, then return with permission metadata attached.",
+          "Explains how a delete propagates: tombstone first so nothing new is served, then purge from every index and cache."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles a deleted document still appearing in a cached result by making authorisation a query-time check that no cache can bypass.",
+          "Handles an indexing backlog by decoupling visibility from queue depth, so old content stays servable and freshness degrades rather than availability.",
+          "Says what happens to a partially indexed document, and why it must never be queryable."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Names retrieval quality as the metric that matters, such as recall at k on a judged set, rather than latency alone.",
+          "Reports indexing lag as a first-class SLO with an alert, because a silently stale index is invisible to users.",
+          "Describes reprocessing and embedding model migration as a background job with a dual-write or side-by-side comparison period."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-feed",
+    "title": "Social home feed",
+    "topic": "Fanout & caching",
+    "minutes": 60,
+    "statement": "A home feed is the most-read surface in the product and the least forgiving of latency, and nearly all of the difficulty comes from one fact: the accounts with the most followers make it impossible to compute a feed at read time.",
+    "assumptions": [
+      "50 million daily active users generating 500 million feed reads a day.",
+      "50 million posts a day, with follower counts skewed to the point where the largest account has tens of millions.",
+      "The feed renders in under 200ms at p95, and a new post appears within 10 seconds.",
+      "Deleted posts and private accounts have to disappear from feeds that were already served, not only from future ones."
+    ],
+    "probes": [
+      {
+        "section": "estimates",
+        "question": "What changes for an author with 50 million followers?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "data",
+        "question": "How do you paginate when new posts arrive?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "ops",
+        "question": "How do you prevent stale caches from leaking private content?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "flow",
+        "scenario": "A celebrity post creates a traffic spike."
+      },
+      {
+        "section": "failure",
+        "scenario": "Fanout workers fall 30 minutes behind."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names the follow graph, the home feed, ranking and fanout as the parts, and says which of them are in scope.",
+          "Puts the recommendation model itself out of scope, treating ranking as a replaceable component behind an interface.",
+          "Defines current server-side authorization on future reads and best-effort removal on connected clients; acknowledges that offline or previously downloaded copies cannot be recalled."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 500 million feed reads a day into a per-second read rate, and 50 million posts into a write rate.",
+          "Reasons about fanout-on-write cost for the largest accounts and concludes that a single strategy cannot serve both ends of the follower distribution.",
+          "Compares read-path latency and fanout write amplification using declared follower/traffic assumptions, rather than inferring the bottleneck from API request counts alone."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Names post, follow edge and timeline entry, and says the timeline is a materialised list rather than a query over the follow graph.",
+          "Uses a fixed chronological high watermark or a pinned ranked feed-session order with a stable cursor, so new arrivals and changing scores cannot silently shift pagination.",
+          "Records enough on each timeline entry to re-check authorisation at read time rather than trusting it at write time."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks the write path: on post, fan out to followers' timelines for ordinary accounts, and take a different route for the very large ones.",
+          "Walks the read path as fetch a candidate page, merge ranked and chronological sources, filter by current authorisation, then paginate by cursor.",
+          "Says what the very large accounts do instead of fanning out, such as a pull at read time or a separate broadcast tier."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles fanout workers falling behind by serving a stale-but-valid timeline and marking it as such, rather than blocking the post.",
+          "Handles a celebrity post spike by separating the broadcast path from the ordinary fanout path so one post cannot stall everyone else's.",
+          "Says how a user who has been fanned out to is prevented from seeing a post they should not, when the authorisation changes after the write."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Describes invalidation on unfollow, delete and account privacy change, and says why a cached timeline entry is not sufficient evidence of permission.",
+          "States the degradation order when the system is unhealthy, from ranked feed through to reverse-chronological, and what the user sees at each step.",
+          "Names the metrics: fanout lag, timeline read latency, cursor gap rate, and the fraction of reads served from cache."
+        ]
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "design-objects",
+    "title": "Resumable file storage service",
+    "topic": "Storage",
+    "minutes": 60,
+    "statement": "A storage service for files too large to send in a single request. An upload has to survive a dropped connection without starting over, and the permissions on a file can be shared, revoked, or destroyed long after the bytes have landed.",
+    "assumptions": [
+      "1 million uploads a day, averaging 20MB with a maximum of 100GB per file.",
+      "An interrupted upload resumes rather than restarting, so a client can lose the network and come back without losing its progress.",
+      "Downloads are served globally, and content integrity is verified by checksum.",
+      "Shared links can be revoked at any time, and a file can be permanently deleted."
+    ],
+    "probes": [
+      {
+        "section": "flow",
+        "question": "How do you commit a multipart upload exactly once?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "ops",
+        "question": "What happens to abandoned parts?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "ops",
+        "question": "How does revocation interact with CDN caches and signed URLs?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "data",
+        "question": "How do you stop two clients uploading the same bytes from storing them twice?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "ops",
+        "question": "Who is allowed to delete a blob that several objects reference, and what does a collector need before it is safe?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "Metadata commits but object finalization fails."
+      },
+      {
+        "section": "ops",
+        "scenario": "A region loses its object storage access."
+      },
+      {
+        "section": "data",
+        "scenario": "Two clients upload byte-identical files at the same moment."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names initiate, upload parts, complete, download, share and delete as the client-facing operations.",
+          "Makes resumability a requirement, so a client that loses its network resumes rather than restarting a large upload.",
+          "Puts transcoding and content processing out of scope, and says the object store holds bytes and metadata only."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 1 million uploads a day into a sustained and a peak part-upload rate, since a large object is many part requests.",
+          "Declares download-frequency and retention assumptions before comparing egress, ingress and storage costs, and connects that comparison to caching and replication choices.",
+          "Reasons about the 100GB maximum forcing multipart for a small share of objects, and what that implies for the session state."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Separates object metadata from blob data, and says why the two have different consistency and scaling needs.",
+          "Models the upload session with its parts and their checksums, so completion can be verified rather than trusted.",
+          "Gives share links an explicit expiry and a revocable identity, rather than an unguessable URL treated as permanent."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks upload as initiate a session, upload parts directly to storage with presigned URLs, then complete, which assembles the object and makes it visible.",
+          "Walks download through current authorization and CDN/storage byte serving; explains that direct signed URLs have an expiry-bounded revocation guarantee and immediate new-request revocation requires an enforced gate.",
+          "Explains why parts upload straight to storage instead of through the service, and what the service therefore never sees."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles a metadata commit that succeeds while object finalization fails, so the two are reconciled rather than left inconsistent.",
+          "Handles an abandoned upload by expiring the session and reclaiming the parts, and says when that cleanup runs.",
+          "Makes completion idempotent, so a retried finalize does not create a second object or lose the first."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "States RPO and RTO for the metadata store and for the blobs, and recognises they are different numbers.",
+          "Describes lifecycle policies for retention and storage class transition, and how deletion interacts with them.",
+          "Says how revocation reaches a CDN that already has the bytes cached, and what guarantee is honestly offered."
+        ]
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "design-metrics",
+    "title": "Real-time metrics and alerting",
+    "topic": "Data pipelines",
+    "minutes": 60,
+    "statement": "A metrics backend has to absorb a firehose, answer questions about it in under a second, and watch it continuously so someone finds out about a problem before a customer reports it. The three pressures point in different directions: writing everything costs more than storing it, querying everything is slow, and watching everything means deciding what is worth an alert at all.",
+    "assumptions": [
+      "5 million samples a second, across 100 million active time series.",
+      "A dashboard showing the last hour renders in under a second.",
+      "Alerts fire within 30 seconds of a breach. Raw data is retained for 7 days and rollups for 13 months.",
+      "Clients may send samples late, send the same sample twice, or attach labels with unbounded cardinality."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "What is the partition key and how do you handle cardinality explosions?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "ops",
+        "question": "How do you evaluate a missing-data alert?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "estimates",
+        "question": "Which aggregates can be merged exactly across shards?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "flow",
+        "scenario": "Ingestion doubles during an incident."
+      },
+      {
+        "section": "ops",
+        "scenario": "One region stops reporting, but services are still running."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names ingest, storage, query and alerting as the four capabilities, and says which have hard latency targets.",
+          "Treats late and out-of-order samples as normal input rather than an error case.",
+          "Puts dashboard rendering out of scope, and says the backend's job ends at returning an aggregate."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 5 million samples a second into daily volume, and 100 million active series into the number that actually drives storage and index size.",
+          "Works out which aggregates can be merged exactly across shards and which cannot, and says what that means for the query fan-out.",
+          "Calculates seven-day raw and thirteen-month rollup storage from stated bytes and resolution, recognizing long rollup retention may exceed the raw footprint and motivating tiering or coarser old buckets."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Names the series key from metric name plus labels, and states what happens when label cardinality is unbounded.",
+          "Separates the raw sample store from downsampled rollups, and names the buckets and the retention of each.",
+          "Defines the deduplication identity for a sample, since a retried send must not double-count."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks ingest as buffer, write to a durable log, then compact into partitioned time-series storage, and says what the log buys.",
+          "Walks a last-hour dashboard query as select the rollup resolution that fits the window, then merge across shards.",
+          "Describes alert evaluation as its own read path with its own latency budget, distinct from the dashboard query."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles ingestion doubling during an incident by applying backpressure at the edge and dropping or sampling deliberately, rather than accepting work it cannot store.",
+          "Handles a region that stops reporting by treating absent data as unknown rather than zero, and by alerting on the absence itself.",
+          "Says what a missing-data alert must do differently from a threshold alert, and why conflating them causes false confidence."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Enforces active-series and label limits per tenant, and explicitly rejects or deliberately aggregates new dimensions when cardinality exceeds budget.",
+          "Monitors the monitoring system itself: ingest lag, dropped samples and the health of the alert pipeline.",
+          "Names the alert state machine, including hysteresis so a value hovering at a threshold does not page continuously, and notification deduplication."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-webhooks",
+    "title": "Reliable webhook delivery",
+    "topic": "Reliability",
+    "minutes": 60,
+    "statement": "Your service publishes an event and the customer decides what to do with it. You cannot know whether their endpoint is fast, healthy, or even still there, and the whole design is about what you owe them when it is not. The tension is that delivering at least once and delivering exactly once are very different asks, and only one of them is achievable over a network you do not control.",
+    "assumptions": [
+      "100 million events a day, each fanned out to at most 20 subscribers.",
+      "The first delivery attempt happens within 5 seconds, and retries continue for up to 24 hours.",
+      "Subscribers may be slow, completely down, or return an ambiguous response such as a timeout after having processed the event.",
+      "Payloads are signed, subscription lists change while events are in flight, and subscribers can ask for a replay."
+    ],
+    "probes": [
+      {
+        "section": "flow",
+        "question": "What does HTTP 200 mean for your delivery guarantee?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "failure",
+        "question": "How do you avoid one slow tenant blocking everyone?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "ops",
+        "question": "How do you safely deliver to arbitrary customer URLs?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "estimates",
+        "question": "Work out the retry budget: how many attempts fit in the 24-hour window, and what happens to the deliveries that run out?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "Is the subscriber URL validated once at subscribe time or on every attempt, and what does a DNS change do to attempts in flight?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "A popular destination is down for 12 hours."
+      },
+      {
+        "section": "failure",
+        "scenario": "A customer rotates their signing secret during a retry wave."
+      },
+      {
+        "section": "estimates",
+        "scenario": "Every destination subscribed to one event type is down at the same time."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names subscribe, publish, deliver, retry and replay as the operations, and says who can see a delivery attempt.",
+          "States the delivery guarantee as at-least-once, and explains why exactly-once across a network you do not control is not available.",
+          "Says what is out of scope, such as the ordering of events across subscriptions, and acknowledges subscribers are third-party code you cannot observe."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 100 million events a day into a per-second delivery rate, and multiplies by the fan-out of up to 20 subscribers.",
+          "Identifies outbound request concurrency as the constraint, not event storage, because every attempt is an external call you do not control.",
+          "Calculates outage backlog and retry amplification using declared endpoint rate, attempt cap, timeout and age budget; does not assume backoff alone creates a particular attempt multiplier."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Gives a durable delivery record per event and subscription, not per event, so each subscriber's fate is independent.",
+          "Keeps immutable event payload and stable delivery identity, while recording the actual signing-key version on each attempt; rotation policy defines old/new verification overlap rather than pinning pending deliveries forever.",
+          "Records the attempt history with its outcome, which is what makes a replay auditable rather than a blind resend."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks delivery as claim a due delivery, sign the payload with a timestamp, POST it, then record the outcome and schedule the next attempt.",
+          "Explains what the subscriber's 2xx actually means, and why a timeout after processing is the case that breaks naive assumptions.",
+          "Describes a replay as creating new delivery attempts against a recorded event, rather than re-publishing the event."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles a destination that is down for 12 hours with exponential backoff, jitter and a retry budget, then a dead-letter state that is visible and replayable.",
+          "Selects the active signing key at each attempt, records its version and fresh timestamp, and distinguishes ordinary overlap from emergency revocation of inflight old-key requests.",
+          "Bounds a slow subscriber with per-endpoint concurrency and timeout limits, so one slow tenant cannot consume the delivery fleet."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Treats arbitrary customer URLs as an SSRF surface: egress controls, address validation and a blocklist, named explicitly.",
+          "Names the metrics: attempt rate, success rate per endpoint, queue age, dead-letter count and the p95 delivery latency.",
+          "Says how a subscriber deduplicates on their side, since at-least-once makes duplicates the subscriber's problem and you must document it."
+        ]
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "design-calendar",
+    "title": "Collaborative booking service",
+    "topic": "Transactions",
+    "minutes": 60,
+    "statement": "A booking service where the entire value of the product is that two people cannot book the same room. Everything else, search, recurring reservations, time zones, cancellation, is secondary to making that one invariant hold under concurrent load from many organizations at once.",
+    "assumptions": [
+      "100,000 organizations sharing 5 million rooms, with 10 million bookings a day.",
+      "No two confirmed bookings for the same room may overlap. This holds under concurrent booking attempts.",
+      "Availability search has a p95 under 200ms, and search results may be briefly stale as a result.",
+      "Reservations can recur, are entered in different time zones, and can be cancelled by either side."
+    ],
+    "probes": [
+      {
+        "section": "failure",
+        "question": "What transaction prevents two simultaneous overlapping bookings?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "data",
+        "question": "How are recurring events represented and exceptions handled?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "How do you make a retried booking request safe?",
+        "difficulty": "Medium"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "Two users book the same slot simultaneously."
+      },
+      {
+        "section": "data",
+        "scenario": "A daylight-saving transition changes a recurring meeting time."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names search availability, booking, reschedule, cancel and recurring series as the operations.",
+          "Makes double booking impossible as an invariant rather than a UI concern, and says so before anything else.",
+          "Puts reminders, invitations and sync with external calendars out of scope, and says notifications are downstream of a confirmed booking."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 10 million bookings a day into a per-second rate and spreads it across 5 million rooms, noticing the write is far less contended than the read.",
+          "Identifies availability search as the real load, since it is issued far more often than a booking is completed.",
+          "Reasons about the index that makes overlap queries cheap, and why a naive scan of a room's bookings does not survive peak search."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Uses half-open intervals throughout, so a booking ending at 10:00 and one starting at 10:00 do not conflict.",
+          "Stores bookings per room with an index on room and time, and says the overlap query is a range scan on that index.",
+          "Stores wall time plus the originating time zone, and normalises to UTC for comparison while preserving the zone for display and recurrence."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks booking as an authoritative transaction with an overlap exclusion constraint or equivalent serializable room invariant, then confirms; uniqueness on start time alone is insufficient.",
+          "Walks search as query candidate rooms by attribute, then a range scan per room for conflicts, and says the result may be briefly stale.",
+          "Explains how recurring series are expanded, stored as concrete occurrences, and how a single exception is represented."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Makes the booking write atomic so two simultaneous requests cannot both succeed, and names the mechanism rather than saying a lock.",
+          "Handles a retried booking request safely with a client idempotency key, so the retry returns the original booking instead of creating a second.",
+          "Preserves local wall-clock recurrence and IANA zone, generates UTC per occurrence, and declares a policy for nonexistent and ambiguous daylight-saving times."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Reconciles cached availability against committed bookings, since a stale cache must never be the thing that authorises a double booking.",
+          "Names the metrics: search latency, booking conflict rate, and the rate of rejected writes that indicate contention.",
+          "Says what happens when an organization is deleted, and how its bookings appear to the people who held them."
+        ]
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "design-flags",
+    "title": "Configuration and feature flags",
+    "topic": "Caching & consistency",
+    "minutes": 60,
+    "statement": "A service that hands configuration and feature flags to hundreds of thousands of backend processes, and is trusted enough that a mistake is an outage. The two requirements pull hard against each other: evaluation has to be fast enough to sit inside a request, and the control plane has to be able to reach every process within seconds without becoming a dependency of them.",
+    "assumptions": [
+      "500,000 connected SDK clients, with 50,000 flag changes a day.",
+      "Local evaluation of a flag takes under 1ms, so it happens in the calling process rather than over the network.",
+      "A change normally propagates to every process within 5 seconds.",
+      "Percentage rollouts, targeting rules and emergency kill switches are all required.",
+      "Processes must keep serving correct, if stale, configuration while the control plane is unavailable."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "How do you make percentage rollout stable for a user?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "data",
+        "question": "What if an older update arrives after a newer one?",
+        "difficulty": "Easy"
+      },
+      {
+        "section": "failure",
+        "question": "What stronger guarantee does an emergency kill switch need?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "A bad config is rolled out globally."
+      },
+      {
+        "section": "failure",
+        "scenario": "Clients are disconnected for 24h."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names the control plane that authors and audits changes, and the data plane that serves evaluation to processes.",
+          "States the evaluation latency target as the reason evaluation happens in the calling process, not over the network.",
+          "Keeps ordinary flags on a validated last-known-good snapshot during control-plane outage, and distinguishes safety-critical enable permissions that expire locally and fail safe."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 500,000 connected clients and 50,000 daily changes into a fan-out problem, and works out the per-change delivery cost.",
+          "Distinguishes the cost of a change reaching everyone from the cost of a client starting cold, which is the case that actually hurts.",
+          "Identifies connection count and per-evaluation cost as the two numbers that matter, and says why 1ms evaluation is a memory-resident requirement."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Gives each configuration version a monotonic number, so an out-of-order update can be detected and discarded rather than applied.",
+          "Stores flags as typed, schema-validated definitions, so a bad value is rejected at authoring time rather than crashing a process at read time.",
+          "Keeps the evaluation inputs needed for stable bucketing, and says which hash and salt make a percentage rollout stable for a user."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks evaluation as read a local snapshot, evaluate locally with no network call, and apply, so the hot path has no dependency.",
+          "Walks a change as author, validate, version, then push to connected clients, with periodic polling as the recovery path.",
+          "Describes a percentage rollout as a stable hash of a user key into fixed buckets, so a user does not flip between variants as the percentage changes."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles a bad configuration rolled out globally by making it revertible, and by supporting a staged rollout that limits the blast radius.",
+          "Keeps ordinary offline configuration valid on restart and fully resyncs after version gaps; safety-sensitive features honor a separately declared freshness lease and fail-safe default.",
+          "Acknowledges an offline client cannot receive an emergency update; bounds offline enabled behavior using a locally enforced lease or server-side action authorization and states the availability/clock tradeoff."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Audits every change with who, when, the previous value and the new one, and says how a rollout is rolled back.",
+          "Reports the propagation lag and the number of clients still on an old version, because neither is otherwise visible.",
+          "Keeps secrets out of ordinary flag snapshots and uses an appropriate credential service; browser-visible values are public to that browser and server credentials may reside in protected process memory during use."
+        ]
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "design-crawler",
+    "title": "Polite distributed crawler",
+    "topic": "Distributed systems",
+    "minutes": 60,
+    "statement": "A crawler at a scale where being a good citizen is a hard engineering requirement rather than a courtesy. The system has to schedule far more fetches than any single host would accept, keep obeying limits it did not choose, and survive pages that are slow, hostile, or effectively unbounded in size.",
+    "assumptions": [
+      "1 billion known URLs, with 100 million pages fetched a day.",
+      "Per-host rate limits and robots policies must be respected, not merely counted.",
+      "Pages change at very different rates, and duplicate URLs and duplicate content are common.",
+      "Fetches can hang indefinitely, and a parsed page can contain an unbounded number of links."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "How is per-host politeness preserved across workers?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "How do you canonicalize URLs without merging distinct resources?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "failure",
+        "question": "What protects against crawl traps and infinitely generated URLs?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "One domain owns half the frontier."
+      },
+      {
+        "section": "failure",
+        "scenario": "Workers crash after fetching but before recording success."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names seed acquisition, frontier scheduling, fetching, parsing, storage and recrawl as the stages.",
+          "Treats being a good citizen as a hard requirement: robots policy and per-host rate limits are obeyed, not merely recorded.",
+          "Puts rendering JavaScript pages out of scope, and says which content classes are therefore not covered."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 1 billion known URLs and 100 million fetches a day into a frontier size and a sustained fetch rate.",
+          "Identifies per-host politeness as a scheduling constraint, since a single large domain can otherwise dominate the whole fleet.",
+          "Says how crawl budget is divided, and what happens to the long tail when the budget is smaller than the frontier."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Uses durable URL leases for recovery plus one fenced per-host politeness authority whose request spacing and concurrency are enforced where outbound connections open.",
+          "Deduplicates at the URL level after canonicalisation and at the content level by checksum, because the same content is often at many URLs.",
+          "Records freshness metadata per URL so recrawl priority is a function of how stale the content is, not of arrival order."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks a fetch as claim from the frontier, check robots and the per-host budget, request with timeout and size limits, parse, extract links, and enqueue the new ones.",
+          "Explains how links are canonicalised, and what stops normalisation from merging two genuinely different resources.",
+          "Describes how a crawl trap is bounded, by depth, page budget and a bound on the number of URLs a single host may contribute."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Retries a crashed fetch under the same host politeness rules, makes content/result/discovery commits idempotent and generation-fenced, and does not promise exactly-once origin requests.",
+          "Handles one domain owning half the frontier by enforcing a per-host share of the crawl budget, so it cannot starve the rest of the web.",
+          "Handles an indefinitely slow host with a hard timeout and a response size cap, so a hung connection cannot hold a worker forever."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Checkpoints the frontier durably so a restart resumes rather than restarting, and says what that costs.",
+          "Names the metrics: fetch rate, per-host politeness compliance, frontier depth, duplicate ratio and parse failure rate.",
+          "Explains parser isolation, so a malformed or hostile page cannot take down the worker that fetched it."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-dispatch",
+    "title": "Nearby driver dispatch",
+    "topic": "Geospatial systems",
+    "minutes": 60,
+    "statement": "Matching riders to drivers, where the matching decision is worth very little on its own but every part of it is contested: a driver who is sent the wrong ride stops accepting work, and a rider left waiting stops using the product. The system is therefore judged as much on what it does when a match is refused as on how fast it finds one.",
+    "assumptions": [
+      "1 million drivers online, each reporting location every 5 seconds.",
+      "20,000 ride requests a minute at peak.",
+      "Matching completes in under 2 seconds at p95, and one driver is never confirmed for two active rides.",
+      "Drivers may reject or fail to answer, riders may cancel, and the service operates independently in each region."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "How do you find nearby drivers without scanning all locations?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "flow",
+        "question": "Where does a proposed assignment become authoritative?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "failure",
+        "question": "What happens when location data is stale?",
+        "difficulty": "Medium"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "Two dispatchers offer rides to the same driver."
+      },
+      {
+        "section": "data",
+        "scenario": "A dense city cell becomes a hotspot."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names driver location reporting, ride request, matching, offer, accept and completion as the operations.",
+          "States that a driver is never confirmed for two active rides as a hard invariant, and treats a driver rejecting as a normal outcome.",
+          "Puts pricing, routing and payment out of scope, and says what the service consumes from them."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 20,000 requests a minute at peak into a per-second matching rate, and 1 million drivers reporting every 5 seconds into an ingest rate.",
+          "Reasons that the location ingest is the larger write load, and that the matching rate is small enough that latency, not throughput, is the constraint.",
+          "Identifies the sub-2-second matching budget as what rules out scanning all driver locations per request."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Maps driver locations into geospatial cells and says how cell size trades query cost against candidate quality.",
+          "Records the freshness timestamp with every location, because a stale location is worse than a missing one and must be distinguishable.",
+          "Models the ride as an explicit state machine, so an offer, an accept and a cancel race cannot both succeed."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks matching as query nearby cells, filter to available drivers with fresh locations, score them, then offer to the best one, and says where the assignment becomes authoritative.",
+          "Walks the offer as a short-lived reservation with a lease, so a driver who does not answer frees the ride automatically.",
+          "Handles a cancellation racing an accept by defining which transition wins, rather than hoping the timings do not collide."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles two dispatchers offering the same driver by making the reservation atomic, so the second offer is rejected rather than both being sent.",
+          "Splits a dense spatial cell into independently indexed child cells with a versioned migration directory and bounded queries; a wider radius alone does not remove a hot partition.",
+          "Says what happens when location data is stale, and why a stale driver is excluded rather than trusted with a wider search."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Names the metrics: time to match, time to accept, offer acceptance rate, and the distribution of wait time by area.",
+          "Keeps each ride and candidate driver under the same regional transaction authority; neighboring indexes are advisory, and an available-driver ownership transfer fences the old owner before reservations resume, with no assignment during transfer.",
+          "States the latency and matching-quality tradeoff explicitly, including which one the business is asking to sacrifice when they conflict."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-video",
+    "title": "Global video streaming",
+    "topic": "Caching & consistency",
+    "minutes": 60,
+    "statement": "A video service with a global audience. A creator uploads one master file, the service transcodes it into a ladder of renditions, and players anywhere adapt to what they can actually download. Two jobs pull against each other. The write path makes a new video watchable as fast as an expensive, serialized ladder allows, and the read path has to start playing within a second from any continent, where serving bytes from origin is the largest line on the cost sheet. Design both, and be honest about which one you are starving.",
+    "assumptions": [
+      "10,000 masters a day, averaging 20 minutes each at an 8Mbit/s mezzanine bitrate, which is about 1.2GB per upload.",
+      "The rendition ladder is five outputs (144p, 360p, 720p, 1080p, audio-only) whose summed bitrate is close to the master's, so the ladder writes roughly as many bytes as the upload reads.",
+      "200,000 viewers are watching at peak, sessions average 20 minutes, and the average selected rendition is 2.5Mbit/s because most sessions settle near the middle of the ladder.",
+      "Time to first frame must be under 1 second at p95 from any continent, including a player whose first request is a video nothing has cached.",
+      "Viewers are 35% Europe, 30% North America, 25% Asia-Pacific, 6% South America and 4% Africa."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "How do you know a rendition is complete and safe to serve before the transcode finishes?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "Trace a play request from a player in Frankfurt to its first video frame, naming every hop and every cache it consults.",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "failure",
+        "question": "A transcode worker dies 40% of the way through the 1080p rendition. What does the player see, and is the retry safe?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "estimates",
+        "scenario": "One video reaches 20,000 concurrent viewers within an hour of upload."
+      },
+      {
+        "section": "failure",
+        "scenario": "The origin region for Asia-Pacific is unreachable for 20 minutes."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names upload, transcode ladder, publish, manifest fetch and segment fetch as five separate operations rather than one 'serve video' path.",
+          "Treats sub-second time to first frame from any continent and publish-after-the-ladder as two independent requirements pulling against each other.",
+          "Puts live streams, DRM and encoder internals out of scope, and says what each would add: a sliding-window manifest, a license hop, or nothing we own."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 10,000 masters a day at 20 minutes and 8Mbit/s into 1.2GB each and 12TB/day of upload, then derives average and peak ingest rate.",
+          "Derives about 1.1Gbit/s of sustained encode output from the ladder, and declares the per-node encode rate it assumes instead of treating transcoding as free.",
+          "Sizes playback as 200,000 concurrent viewers x 2.5Mbit/s = 500Gbit/s, about 62.5GB/s at peak, then works out monthly egress and what a 95% edge hit rate removes from it."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Models rendition, manifest version, playback session and watch position as separate entities with their own keys, rather than one video row with a status column.",
+          "Makes completion checkable: expected segment count, summed segment duration within tolerance of the probe, and a checksum, so a half-written rung is never publishable.",
+          "Keys segments by rendition plus segment index so a re-run of the transcode is idempotent, and keeps watch position durable and per device for resume."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks playback as manifest from the edge, player picks a rung from measured throughput, segment requests hit the CDN, and only cache misses reach origin.",
+          "Walks the write path as presigned direct-to-storage upload, probe, encode each rung into a staging prefix, verify, then publish a new immutable manifest version.",
+          "Explains how a short-lived signed scope reaches segment URLs and the edge, and states honestly what revocation can and cannot recall from an already-cached copy."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Quantifies the viral case: 20,000 concurrent viewers on one object is 50Gbit/s from a single key, so it needs per-object rate limiting, pre-warmed cache and token reuse.",
+          "Handles origin-region loss by serving what the edge already holds and failing manifest lookups over to another region, rather than cross-region re-origin at peak cost.",
+          "Treats a crashed transcode as an idempotent retry on the same segment keys with publish still gated on verification, so no player ever sees a partial ladder."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Reports time to first frame separately from rebuffer ratio and per-rung start-up delay, because a cold edge cache and a cold encoder look identical to the player.",
+          "Names media-specific metrics: cache hit ratio by rung and region, encode queue age, upload-to-playable latency, and segment 404 rate per rendition.",
+          "Versions the ladder in the manifest so a player never mixes rungs from two encoder versions, canaries on a share of new uploads, and rolls back by stopping the canary."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-pipeline",
+    "title": "Linear multi-step CI/CD pipeline",
+    "topic": "Data pipelines",
+    "minutes": 60,
+    "statement": "Engineers push code and expect a platform that builds, tests and deploys it without anyone running commands by hand. Two jobs pull against each other: every commit should get a verdict in minutes so nobody is left guessing, and what reaches production should be a gated, reproducible artifact traceable to one commit. The interesting part is the path between those two, not the compile step.",
+    "assumptions": [
+      "500 engineers push about 20 times a day each, so 10,000 pushes a day. 80% land in a 10-hour working day, which is 8,000 / 36,000s = 0.22/s, and the intra-day peak runs about 5x that, so roughly 1 push/s.",
+      "30% of pushes touch documentation only and are answered by a path filter with no runner at all; the other 70% need a full build, so peak full builds are about 0.7/s.",
+      "A warm-cache build finishes in 4 minutes; a cold-cache build takes 18 minutes because dependency restore and a full compile dominate. I assume 80% of builds hit a warm cache.",
+      "The longest workflow has 12 steps. Three of them cost more than the rest combined: dependency restore, the integration suite, and the container image build. It ends in a manual approval gate before production.",
+      "About 20 production releases a day across the company, 4 of them hotfixes, and at most one production release per branch per day."
+    ],
+    "probes": [
+      {
+        "section": "flow",
+        "question": "Two engineers push to the same branch seconds apart. What happens to the first run?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "data",
+        "question": "How does a built image get from a workflow step to a deployment with no shared filesystem?",
+        "difficulty": "Medium"
+      },
+      {
+        "section": "failure",
+        "question": "A step in a fork pull request needs a secret. How do you scope it?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "data",
+        "scenario": "A base image change drops the warm cache hit rate from 80% to 5%."
+      },
+      {
+        "section": "failure",
+        "scenario": "A transitive dependency is compromised and every pipeline installs it."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names push-triggered runs, workflow graph resolution, job scheduling, artifact retrieval, log streaming and deployment as the operations, and lists re-run, cancel and promote as separate user actions.",
+          "States two distinct obligations, fast per-commit feedback and a gated reproducible release, and gives the fast lane and the gated lane their own queues, pools and latency targets rather than one shared queue.",
+          "Puts the git host, the container registry and the build hardware out of scope while consuming them, and calls a runner executing repository code the sharpest edge in the system rather than an implementation detail."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 10,000 pushes/day into about 0.22/s across the working day and about 1 push/s at the intra-day peak, then applies the 70% full-build split to reach about 0.7 builds/s, showing each division.",
+          "Computes mean job duration as 0.8 x 240 + 0.2 x 1,080 = 408s = 6.8 minutes, applies it to get about 0.7 x 408 = 286 concurrent runners, then divides by a 70% utilization target for about 408 provisioned runners.",
+          "Names runner slot concurrency and queue age as the first thing to saturate rather than push throughput, and explains that a warm-to-cold cache ratio change multiplies mean duration and therefore queue age."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Separates workflow definition, run, job, step attempt, artifact and log into their own records, with a unique key including commit sha, workflow revision and attempt so a redelivered push cannot create a duplicate run.",
+          "Makes artifacts immutable and content-addressed and has the deployment record reference the artifact digest rather than the run, so promotion is a pointer move and the deployed bytes are the tested bytes.",
+          "Keeps logs an append-only stream with their own retention separate from expensive artifacts, and records credential grants as their own short-lived auditable rows rather than fields on the job."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks a push as verify signature, dedupe on delivery id, resolve the workflow at the pushed sha, then commit the run plus its first ready job set in one transaction before acknowledging, so an accepted push is never unqueued.",
+          "Walks a job as lease claim, provision a fresh runner, run steps sequentially while streaming logs, upload the artifact with its digest, then complete conditionally on the lease epoch so a duplicate or cancelled job cannot publish.",
+          "Has the deploy job pull the artifact by digest and never rebuild it, and separates superseding an old run from rolling back a deployment that run already wrote."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Requires one fresh ephemeral runner per job attempt with no host mounts, no carried filesystem and no reusable credential, quarantines anything a cancelled or lost attempt uploaded, and enforces default-deny egress through an allowlisting proxy covering DNS and metadata endpoints.",
+          "Scopes credentials per job by token exchange bound to repository, ref and environment with a minutes-long lifetime, gives fork pull requests nothing at all, and treats a runner that executed repository code as tainted and disposable.",
+          "Handles a compromised transitive dependency by pinning lock files and base images by digest, blocking that digest at the registry and the egress proxy, invalidating every dependent cache key and holding affected deployments rather than assuming they are clean."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Names queue age by lane, cold-start time to first log line, warm versus cold cache ratio, runner pool utilization, superseded-run ratio and any artifact digest mismatch treated as a security signal rather than a performance one.",
+          "Separates the two rollout paths: workflow definitions validated and versioned by the commit that carries them, and the runner fleet upgraded by canary on a small pool comparing job success rate and cold-start time before widening.",
+          "Keeps self-hosted runners a separate disposable fleet with no route to anything trusted, alerts on a job requesting a secret grant it has never requested before, and pins digests referenced by live deployments so rollback redeploys bytes."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-chess",
+    "title": "Online chess with matchmaking",
+    "topic": "Real-time systems",
+    "minutes": 60,
+    "statement": "Ranked online chess. A player joins a queue, is matched with someone of similar strength, plays a real-time game over a connection that will drop at least once, and the result then moves their rating. Two jobs pull against each other: the shortest wait in the queue, and a pairing fair enough that the rating means something, without quietly abandoning whoever is already waiting.",
+    "assumptions": [
+      "400,000 players are online at the evening peak: about 20,000 in a queue and 380,000 in games, so roughly 190,000 games in progress.",
+      "Ratings run from 800 to 2,800 on a Glicko-style scale. A 100-point band holds 5% of the online population, about 20,000 players, while the widest 200-point band at each end holds under 2,000.",
+      "80% of games are rated with a clock, 20% are untimed. A rated game only happens when both players queued for one.",
+      "A pairing should be offered within 30 seconds of joining the queue, and the first move should reach the opponent's board within 5 seconds of the pairing being accepted.",
+      "An average game is 40 moves over about 25 minutes. Rated games use a 10-minute clock with a 5-second increment, and the server ends a game at threefold repetition or after 75 moves by either side."
+    ],
+    "probes": [
+      {
+        "section": "estimates",
+        "question": "How wide may the rating band get before a pairing stops being fair?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "A player reconnects 40 seconds after dropping, and the opponent has moved twice. What does that client receive?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "failure",
+        "question": "How do you detect a player who is not generating their own moves?",
+        "difficulty": "Hard"
+      }
+    ],
+    "failures": [
+      {
+        "section": "failure",
+        "scenario": "A player's connection drops mid-game for 90 seconds while their clock keeps running."
+      },
+      {
+        "section": "estimates",
+        "scenario": "Matchmaking starves in the top two rating bands for 20 minutes on a Saturday night."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names queue join and leave, pairing, move submission, opponent delivery, reconnect, result reporting and the rating update as distinct behaviours, and keeps rated and untimed as separate queues.",
+          "Makes the server the sole authority for legality, ply order and the clock, and says so before the architecture, because that is what makes cheating and clock disputes bounded problems.",
+          "Puts tournaments, spectator broadcast and engine-grade anti-cheat out of scope while keeping cheap statistical detection in scope, and declines to promise which process or machine hosts a game."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 400,000 peak players into about 190,000 games, computes 190,000 x 40 moves over 1,500s as about 5 moves/s fleet-wide with 380,000 open connections as the real load, and sizes the log at 456,000 games x 40 = 18.2 million moves a day.",
+          "Does the band arithmetic: 400,000 players over 2,000 rating points makes a 100-point band 5%, about 20,000 players, while the whole queue holds 20,000, so most bands pair inside one matcher tick.",
+          "Works the thin tail explicitly: a 2,000-player band is about 1,000 concurrent games, so that band completes at most 1,000 / 25 = 40 pairings a minute, and widening the band cannot fix a band that is too small."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Names player, rating_history, game, move, clock and queue_ticket, with rating_history append-only so a rating dispute can be answered from committed rows rather than argued.",
+          "Has the server assign ply and keeps a unique (game_id, client_move_id), so a move retried over a flaky socket cannot be applied twice or at the wrong ply.",
+          "Copies both ratings into the game record at pairing time and keeps the clock server-only with a last-action timestamp, so a mid-game rating change cannot rewrite a result and a client cannot understate its own clock."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks pairing as take the longest-waiting ticket, pick the best in-band partner, consume both tickets atomically, then commit one game carrying both rating snapshots and assigned colours.",
+          "Walks a move as validate against the materialised position, check side to move, charge the server clock by measured elapsed time, assign the next ply, append durably, then fan out to the opponent.",
+          "Walks reconnect as present since_ply, replay the missed plies from the durable log, return the authoritative clock and last committed ply, then attach to the live stream, so the client learns whether its own last move landed."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Keeps the clock running during a disconnect, charges the downtime from server receive timestamps, and has the server itself forfeit on time with a reason code rather than trusting the opponent's claim.",
+          "Fences a second client for the same account with a session epoch so only the newest connection may move, which is exactly what reconnection otherwise creates.",
+          "Treats cheating as a floor of server-side legality plus statistical evidence, holds the rating change of a flagged game pending human review, and refuses to auto-ban on a single signal because the honest opponent's rating is rewritten too."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Names pairing latency p50 and p95, wait time by band and mode, share of pairings landing inside the declared band, delivery lag from committed ply to opponent screen, and rating history lag.",
+          "Rolls out a matcher change by replaying recorded queue tickets offline before enabling it, since queue dynamics depend on the waiting population a live A/B would split, and dual-runs old and new rating formulas in parallel before cutting over.",
+          "Treats rating inflation through alt accounts, smurfs and shared accounts as the abuse that matters, with provisional ratings for new accounts and pairing restrictions by account age at the top of the ladder."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "design-payments",
+    "title": "Offline payment reconciliation",
+    "topic": "Transactions",
+    "minutes": 60,
+    "statement": "A marketplace takes a buyer's money, holds it, and owes part of it to the seller whose connected account supplied the goods. The network that moves the money does not answer questions: it publishes settlement reports days later, in files that can repeat a row, skip a day, or restate a fee. The hard part is knowing, at any moment, exactly what is owed to whom, and two jobs pull against each other: never pay a seller twice and never fail to pay a seller at all, against making the balance the seller sees move within seconds.",
+    "assumptions": [
+      "12 million transactions a month at an average ticket of $40, which is $480 million of buyer volume a month.",
+      "I take 15% of the ticket as the marketplace fee, and the network charges 2.9% plus 30 cents on every transaction.",
+      "200,000 sellers, so the average seller sees 60 transactions a month; disputes run at 0.5%, which is 60,000 a month.",
+      "Settlement arrives as a daily CSV batch, one line per transaction with a date, an amount, a fee and a network reference, but no idempotency key and no global sequence, so the same row can appear in two consecutive files.",
+      "A report can be 48 hours late, a fee restatement can follow 30 days later, and I have 5 business days to reconcile a period before funds must move."
+    ],
+    "probes": [
+      {
+        "section": "data",
+        "question": "The settlement report has no idempotency key. What do you key on so a repeated row cannot be paid out twice?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "flow",
+        "question": "The report states a fee that does not match the fee we charged. What do you do with that line?",
+        "difficulty": "Hard"
+      },
+      {
+        "section": "failure",
+        "question": "A dispute arrives three weeks after the transaction settled and the money is already in the seller's account. What happens?",
+        "difficulty": "Medium"
+      }
+    ],
+    "failures": [
+      {
+        "section": "estimates",
+        "scenario": "The settlement report arrives with an entire day missing."
+      },
+      {
+        "section": "data",
+        "scenario": "A settlement line references a transaction ID we have never recorded."
+      }
+    ],
+    "rubric": [
+      {
+        "section": "scope",
+        "expects": [
+          "Names charge the buyer, allocate the seller share, absorb the settlement report, reconcile and pay out as the five operations, and says the ledger is the product rather than a side effect.",
+          "States the payout invariant before anything else: never pay twice and never withhold, and names the fast seller-visible balance as the job that pulls against it.",
+          "Puts card network mechanics, buyer checkout experience and seller tax reporting out of scope, and says disputes and fee restatements arrive as later entries rather than as edits."
+        ]
+      },
+      {
+        "section": "estimates",
+        "expects": [
+          "Turns 12 million transactions a month into 400,000 a day and about 4.6/s, and multiplies by the $40 average ticket for $16 million of buyer volume a day.",
+          "Does the money arithmetic: 15% of $480 million is $72 million of marketplace fee, the network takes 2.9% plus 30 cents which is $13.92 million plus $3.6 million, and disputes at 0.5% are $2.4 million a month.",
+          "Sizes the reconciliation path off settlement volume rather than checkout: 400,000 report lines a day, at most 800,000 unreconciled inside the 48-hour lag, and says payout throughput or unmatched lines binds first."
+        ]
+      },
+      {
+        "section": "data",
+        "expects": [
+          "Separates transaction, settlement line, payout and seller balance, and says which three are append-only records and which one is a projection that can be rebuilt.",
+          "Keeps a double-entry ledger in integer minor units where the postings for one movement sum to zero, and says no balance is ever edited directly.",
+          "Keys a settlement line on a content identity of reference, business date, gross and fee under a unique constraint, so a repeated row is rejected and a restatement is never an update."
+        ]
+      },
+      {
+        "section": "flow",
+        "expects": [
+          "Walks authorize and capture as writing balanced ledger postings plus an escrow balance, not as a payment call, so the money path and the books path are separate.",
+          "Walks one report line through match against the expected settlement, difference classification, and either posting the network fee to a variance account or parking the line in an exception queue.",
+          "Walks a payout run as computing available balance from posted undisputed funds minus a dispute reserve, refusing sellers with open exceptions, and submitting an idempotent batch keyed on the run id."
+        ]
+      },
+      {
+        "section": "failure",
+        "expects": [
+          "Handles a duplicated settlement line with an insert-if-absent on content identity so the repeat is a no-op, and names the constraint that makes it safe rather than saying a check.",
+          "Handles a missing report day with a declared coverage check that blocks payout and pages on the oldest gap, and says the seller sees a stated reconciling state instead of a shrunken balance.",
+          "Handles a late fee restatement or a three-week-old dispute as a new dated posting against the original transaction, so the closed period is not rewritten and money already paid out becomes a receivable."
+        ]
+      },
+      {
+        "section": "ops",
+        "expects": [
+          "Reconciles three independent numbers daily, buyer debits, network settlement gross and ledger postings per currency, and pages on a break larger than a stated tolerance.",
+          "Names the metrics: unreconciled volume and oldest uncovered business date, exception queue depth by reason, duplicate line rate, fee variance per thousand and payout failure rate.",
+          "Separates the permission to schedule a payout from the permission to release funds, and treats the transfer credential as the security concern worth the most attention."
+        ]
+      }
+    ],
+    "difficulty": "Hard"
+  }
+]
