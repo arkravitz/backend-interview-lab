@@ -1,0 +1,36 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm run test:styles
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r tests/requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Browser regressions
+        run: |
+          npm run dev -- --port 3000 > /tmp/lab-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID"; cat /tmp/lab-server.log' EXIT
+          READY=0
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://localhost:3000 >/dev/null; then READY=1; break; fi
+            sleep 1
+          done
+          test "$READY" = 1
+          LAB_URL=http://localhost:3000 npm run test:browser

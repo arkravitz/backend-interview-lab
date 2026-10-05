@@ -1,0 +1,1246 @@
+[
+  {
+    "id": "ttl",
+    "title": "Expiring key-value store",
+    "topic": "State & time",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "class TTLStore:\n    def set(self, key, value, now, ttl=None):\n        pass\n\n    def get(self, key, now):\n        pass\n",
+    "statement": "Implement TTLStore.set(key, value, now, ttl=None) and TTLStore.get(key, now). get returns None when the key is missing or expired. A finite ttl expires when now >= set_time + ttl; ttl=None never expires; ttl=0 is already expired. Writing an existing key replaces its value and expiration together. Values are strings, timestamps are nondecreasing, and the wall clock is never read.",
+    "examples": "s.set(\"a\", \"v\", 10, ttl=5); s.get(\"a\", 14) → \"v\"; s.get(\"a\", 15) → None",
+    "tests": [
+      {
+        "name": "Read, overwrite, missing",
+        "code": "s=TTLStore(); assert s.get(\"x\",0) is None; s.set(\"x\",\"a\",1); assert s.get(\"x\",2)==\"a\"; s.set(\"x\",\"b\",3); assert s.get(\"x\",100)==\"b\""
+      },
+      {
+        "name": "Exact expiration",
+        "code": "s=TTLStore(); s.set(\"x\",\"a\",10,5); assert s.get(\"x\",14)==\"a\"; assert s.get(\"x\",15) is None"
+      },
+      {
+        "name": "Zero TTL and renewed lifetime",
+        "code": "s=TTLStore(); s.set(\"x\",\"a\",0,0); assert s.get(\"x\",0) is None; s.set(\"y\",\"a\",1,2); s.set(\"y\",\"b\",2,10); assert s.get(\"y\",3)==\"b\"; assert s.get(\"y\",12) is None"
+      },
+      {
+        "name": "Permanent overwrite survives old expiry",
+        "code": "s=TTLStore(); s.set(\"x\",\"old\",0,2); s.set(\"x\",\"\",1); assert s.get(\"x\",2)==\"\"; assert s.get(\"x\",100000)==\"\""
+      },
+      {
+        "name": "Independent instances and keys",
+        "code": "a=TTLStore(); b=TTLStore(); a.set(\"x\",\"a\",0,1); a.set(\"y\",\"b\",0,10); assert b.get(\"y\",0) is None; assert a.get(\"x\",1) is None; assert a.get(\"y\",1)==\"b\""
+      }
+    ],
+    "solution": "class TTLStore:\n    \"\"\"A key-value store whose entries can expire.\n\n    Every method takes the current time as an argument, so behaviour never\n    depends on the wall clock and a test can move time forward by hand.\n    \"\"\"\n\n    def __init__(self):\n        # key -> (value, expires_at), where expires_at is None for \"never\".\n        self._entries = {}\n\n    def set(self, key, value, now, ttl=None):\n        # Both fields live in one record, so an overwrite cannot leave a\n        # stale expiration behind: writing without a ttl clears the old one.\n        expires_at = None if ttl is None else now + ttl\n        self._entries[key] = (value, expires_at)\n\n    def get(self, key, now):\n        entry = self._entries.get(key)\n        if entry is None:\n            return None\n\n        value, expires_at = entry\n        if expires_at is not None and now >= expires_at:\n            # The boundary is inclusive: at exactly expires_at it is gone.\n            # Dropping it here keeps the store from growing without bound.\n            del self._entries[key]\n            return None\n\n        return value\n",
+    "hints": [
+      "Keep value and expiration together.",
+      "Treat expiration as a half-open interval."
+    ],
+    "followups": [
+      "Stage 2: implement delete and prefix scan with sorted live keys.",
+      "Stage 3: add snapshot/restore that preserves remaining TTL.",
+      "How would you reclaim keys that are never read again?"
+    ],
+    "complexity": "O(1) average per operation; O(n) retained keys. Lazy expiry can retain untouched expired keys.",
+    "difficulty": "Easy"
+  },
+  {
+    "id": "limiter",
+    "title": "Per-client sliding rate limiter",
+    "topic": "Queues & windows",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "class RateLimiter:\n    def __init__(self, limit, window):\n        pass\n\n    def allow(self, client, now):\n        pass\n",
+    "statement": "Allow at most limit accepted requests per client in (now-window, now]. Rejected requests do not consume quota. limit and window are positive. Timestamps are globally nondecreasing; repeated timestamps are valid. Return a boolean.",
+    "examples": "limit=2, window=10: requests at 0, 1, 2, 10 → True, True, False, True",
+    "tests": [
+      {
+        "name": "Boundary and rejected requests",
+        "code": "r=RateLimiter(2,10); assert [r.allow(\"a\",t) for t in [0,1,2,10,11]]==[True,True,False,True,True]"
+      },
+      {
+        "name": "Client isolation",
+        "code": "r=RateLimiter(1,5); assert r.allow(\"a\",0); assert r.allow(\"b\",0); assert not r.allow(\"a\",0); assert r.allow(\"a\",5)"
+      },
+      {
+        "name": "Burst",
+        "code": "r=RateLimiter(3,10); assert [r.allow(\"x\",0) for _ in range(5)]==[True,True,True,False,False]"
+      },
+      {
+        "name": "Rejected burst does not extend window",
+        "code": "r=RateLimiter(1,10); assert r.allow(\"x\",0); assert all(not r.allow(\"x\",t) for t in range(1,10)); assert r.allow(\"x\",10)"
+      },
+      {
+        "name": "Reference model over repeated timestamps",
+        "code": "import random\nrng=random.Random(7); r=RateLimiter(3,7); accepted={}; now=0\nfor _ in range(300):\n now+=rng.randrange(3); c=rng.choice([\"a\",\"b\",\"c\"]); q=[t for t in accepted.get(c,[]) if t>now-7]; expected=len(q)<3; assert r.allow(c,now)==expected\n if expected:q.append(now)\n accepted[c]=q"
+      }
+    ],
+    "solution": "from collections import defaultdict, deque\n\n\nclass RateLimiter:\n    \"\"\"A strict sliding window over accepted requests, per client.\n\n    Each client has an independent queue of accepted timestamps, so one\n    client can never spend another's quota.\n    \"\"\"\n\n    def __init__(self, limit, window):\n        self.limit = limit\n        self.window = window\n        self.requests = defaultdict(deque)\n\n    def allow(self, client, now):\n        q = self.requests[client]\n        # The window is half-open, (now - window, now], so a request accepted\n        # exactly `window` ago has already fallen out. Evicting at or before\n        # that boundary is the whole correctness of the limiter.\n        while q and q[0] <= now - self.window:\n            q.popleft()\n        if len(q) >= self.limit:\n            # Rejected, so nothing is queued and no quota is spent.\n            return False\n        q.append(now)\n        return True\n",
+    "hints": [
+      "Only store accepted timestamps.",
+      "A deque supports expiration from the oldest end."
+    ],
+    "followups": [
+      "Stage 2: weighted requests and per-client policies.",
+      "Stage 3: compare token bucket bursts with strict sliding windows.",
+      "Discuss atomicity across multiple application servers."
+    ],
+    "complexity": "Amortized O(1) per request; O(clients × limit) timestamps.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "lru",
+    "title": "LRU response cache",
+    "topic": "Maps & linked structures",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "class LRUCache:\n    def __init__(self, capacity):\n        pass\n\n    def get(self, key):\n        pass\n\n    def put(self, key, value):\n        pass\n",
+    "statement": "Implement an LRU cache with nonnegative capacity. get returns -1 when absent. Successful gets and puts make a key most recently used. Updating a key does not increase size. Evict the least recently used key when necessary. Values are nonnegative integers.",
+    "examples": "capacity=2; put a,b; get a; put c → b is evicted",
+    "tests": [
+      {
+        "name": "Eviction and recency",
+        "code": "c=LRUCache(2); c.put(\"a\",1); c.put(\"b\",2); assert c.get(\"a\")==1; c.put(\"c\",3); assert c.get(\"b\")==-1; assert c.get(\"c\")==3"
+      },
+      {
+        "name": "Update",
+        "code": "c=LRUCache(2); c.put(\"a\",1); c.put(\"b\",2); c.put(\"a\",9); c.put(\"c\",3); assert c.get(\"a\")==9; assert c.get(\"b\")==-1"
+      },
+      {
+        "name": "Zero capacity",
+        "code": "c=LRUCache(0); c.put(\"x\",1); assert c.get(\"x\")==-1"
+      },
+      {
+        "name": "Update changes recency without growing size",
+        "code": "c=LRUCache(2); c.put(1,0); c.put(2,2); c.put(1,3); c.put(3,4); assert c.get(2)==-1; assert c.get(1)==3; assert c.get(3)==4"
+      },
+      {
+        "name": "Reference model under mixed access",
+        "code": "import random\nfrom collections import OrderedDict\nrng=random.Random(11); c=LRUCache(3); ref=OrderedDict()\nfor _ in range(300):\n k=rng.randrange(6)\n if rng.randrange(2):\n  v=rng.randrange(10); c.put(k,v); ref[k]=v; ref.move_to_end(k)\n  if len(ref)>3:ref.popitem(last=False)\n else:\n  assert c.get(k)==ref.get(k,-1)\n  if k in ref:ref.move_to_end(k)"
+      }
+    ],
+    "solution": "from collections import OrderedDict\n\n\nclass LRUCache:\n    \"\"\"A fixed-size cache that evicts the least recently used entry.\n\n    A dict alone cannot do this in constant time, because finding the oldest\n    entry means scanning it. An ordered dict gives both, since it remembers\n    the order keys were used.\n    \"\"\"\n\n    def __init__(self, capacity):\n        self.capacity = capacity\n        self.data = OrderedDict()\n\n    def get(self, key):\n        if key not in self.data:\n            # A miss leaves the recency order untouched, which is what stops a\n            # lookup for a missing key from evicting the entry that mattered.\n            return -1\n        self.data.move_to_end(key)\n        return self.data[key]\n\n    def put(self, key, value):\n        # Assigning an existing key updates in place rather than adding a\n        # second entry, so the size does not grow.\n        self.data[key] = value\n        self.data.move_to_end(key)\n        if len(self.data) > self.capacity:\n            # Oldest first. A single eviction is enough because capacity\n            # changes by at most one per call.\n            self.data.popitem(last=False)\n",
+    "hints": [
+      "Track both lookup and recency.",
+      "OrderedDict is allowed; explain what a manual implementation would require."
+    ],
+    "followups": [
+      "Stage 2: implement using a hash map and doubly linked list.",
+      "Stage 3: add TTL and byte-size limits.",
+      "Discuss cache stampedes and concurrent get-or-load."
+    ],
+    "complexity": "O(1) average get/put; O(capacity) space.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "temporal",
+    "title": "Historical configuration lookup",
+    "topic": "Binary search",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "class TimeMap:\n    def set(self, key, value, timestamp):\n        pass\n\n    def get(self, key, timestamp):\n        pass\n",
+    "statement": "Store timestamped string values. For each key, set timestamps are strictly increasing. get may query any timestamp and returns the newest value at or before it, or None. Reads do not modify history.",
+    "examples": "set(\"flag\",\"on\",5); get(\"flag\",4) → None; get(\"flag\",8) → \"on\"",
+    "tests": [
+      {
+        "name": "Historical queries",
+        "code": "m=TimeMap(); m.set(\"a\",\"x\",2); m.set(\"a\",\"y\",7); assert [m.get(\"a\",t) for t in [1,2,6,7,99]]==[None,\"x\",\"x\",\"y\",\"y\"]"
+      },
+      {
+        "name": "Isolation and missing",
+        "code": "m=TimeMap(); m.set(\"a\",\"x\",1); m.set(\"b\",\"y\",2); assert m.get(\"a\",5)==\"x\"; assert m.get(\"c\",5) is None"
+      },
+      {
+        "name": "Reads preserve history and empty values",
+        "code": "s=TimeMap(); s.set(\"x\",\"\",2); s.set(\"x\",\"later\",5); assert s.get(\"x\",100)==\"later\"; assert s.get(\"x\",2)==\"\"; assert s.get(\"x\",1) is None; assert s.get(\"x\",4)==\"\""
+      },
+      {
+        "name": "Reference lookup across sparse history",
+        "code": "s=TimeMap()\nfor i in range(100):s.set(\"x\",str(i),i*3)\nfor t in range(-1,305):\n expected=None if t<0 else str(min(t//3,99)); assert s.get(\"x\",t)==expected"
+      }
+    ],
+    "solution": "from bisect import bisect_right\n\n\nclass TimeMap:\n    \"\"\"Answers which value was in force at any past timestamp.\n\n    A single \"current value\" per key would be wrong the moment a query asks\n    about an older moment, so the whole history is kept and searched.\n    \"\"\"\n\n    def __init__(self):\n        # key -> (sorted timestamps, parallel values)\n        self.data = {}\n\n    def set(self, key, value, timestamp):\n        times, values = self.data.setdefault(key, ([], []))\n        times.append(timestamp)\n        values.append(value)\n\n    def get(self, key, timestamp):\n        times, values = self.data.get(key, ([], []))\n        # Rightmost timestamp at or before the query; -1 when the query\n        # predates every write for this key.\n        i = bisect_right(times, timestamp) - 1\n        return values[i] if i >= 0 else None\n",
+    "hints": [
+      "Keep ordered history per key.",
+      "Find the rightmost timestamp <= query."
+    ],
+    "followups": [
+      "Stage 2: support out-of-order writes and duplicate timestamps.",
+      "Stage 3: compact history while honoring active snapshots."
+    ],
+    "complexity": "O(1) append; O(log n) query per key; O(total writes) space.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "transactions",
+    "title": "Nested transactional store",
+    "topic": "OOP & state",
+    "mode": "Think before coding",
+    "minutes": 60,
+    "starter": "class TransactionStore:\n    def get(self, key):\n        pass\n\n    def set(self, key, value):\n        pass\n\n    def delete(self, key):\n        pass\n\n    def begin(self):\n        pass\n\n    def commit(self):\n        pass\n\n    def rollback(self):\n        pass\n",
+    "statement": "Implement a string store with nested transactions. Reads see the most recent changes. begin starts a nested scope; commit merges only the innermost scope into its parent; rollback discards only the innermost scope. Missing get returns None. commit/rollback without an active transaction raise ValueError. delete on missing keys is a no-op.",
+    "examples": "set a=1; begin; set a=2; begin; delete a; commit; rollback → a=1",
+    "tests": [
+      {
+        "name": "Nested rollback",
+        "code": "s=TransactionStore(); s.set(\"a\",\"1\"); s.begin(); s.set(\"a\",\"2\"); s.begin(); s.delete(\"a\"); assert s.get(\"a\") is None; s.commit(); assert s.get(\"a\") is None; s.rollback(); assert s.get(\"a\")==\"1\""
+      },
+      {
+        "name": "Commit to base",
+        "code": "s=TransactionStore(); s.begin(); s.set(\"x\",\"v\"); s.commit(); assert s.get(\"x\")==\"v\"; s.delete(\"x\"); assert s.get(\"x\") is None"
+      },
+      {
+        "name": "Invalid scope",
+        "code": "s=TransactionStore()\nfor fn in [s.commit,s.rollback]:\n    try: fn()\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError\")"
+      },
+      {
+        "name": "Nested deletion committed then rolled back",
+        "code": "s=TransactionStore(); s.set(\"a\",\"root\"); s.begin(); s.begin(); s.delete(\"a\"); s.commit(); assert s.get(\"a\") is None; s.rollback(); assert s.get(\"a\")==\"root\""
+      },
+      {
+        "name": "Empty nested scopes and invalid operations",
+        "code": "s=TransactionStore(); s.delete(\"absent\"); s.begin(); s.begin(); s.commit(); s.rollback()\nfor op in [s.commit,s.rollback]:\n try:op()\n except ValueError:pass\n else:raise AssertionError(\"Expected ValueError\")"
+      }
+    ],
+    "solution": "class TransactionStore:\n    \"\"\"A key-value store with arbitrarily nested transactions.\n\n    Each scope is a layer of overrides rather than a copy of the data, so\n    nesting costs a dict and committing one layer is a single merge.\n    \"\"\"\n\n    def __init__(self):\n        # Layer 0 is the committed state; later layers are open scopes.\n        self.layers = [{}]\n        # A sentinel for a delete, because None is a legal value to store.\n        self.deleted = object()\n\n    def get(self, key):\n        # Newest layer wins, so a read sees everything written in this scope\n        # and everything its ancestors committed.\n        for layer in reversed(self.layers):\n            if key in layer:\n                value = layer[key]\n                return None if value is self.deleted else value\n        return None\n\n    def set(self, key, value):\n        self.layers[-1][key] = value\n\n    def delete(self, key):\n        # Recorded as an override rather than a removal, so the delete is\n        # visible inside the transaction and undone by a rollback.\n        self.layers[-1][key] = self.deleted\n\n    def begin(self):\n        self.layers.append({})\n\n    def commit(self):\n        if len(self.layers) == 1:\n            raise ValueError('No transaction')\n        # Merged upward rather than applied, which is what makes a nested\n        # commit affect only the innermost scope.\n        changes = self.layers.pop()\n        self.layers[-1].update(changes)\n\n    def rollback(self):\n        if len(self.layers) == 1:\n            raise ValueError('No transaction')\n        # Simply dropping the layer discards it, and leaves every enclosing\n        # scope exactly as it was.\n        self.layers.pop()\n",
+    "hints": [
+      "A stack of change maps avoids copying all data.",
+      "Deletion needs a marker that shadows older layers."
+    ],
+    "followups": [
+      "Stage 2: count keys equal to a value without scanning the store.",
+      "Stage 3: discuss isolation when two clients write concurrently."
+    ],
+    "complexity": "get O(depth), set/delete O(1), commit O(changes), rollback O(changes) for reclamation; space O(retained changes).",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "scheduler",
+    "title": "Dependency build scheduler",
+    "topic": "Graphs",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "def build_order(tasks, dependencies):\n    pass\n",
+    "statement": "Return a valid order for unique string tasks. dependencies contains (prerequisite, dependent) pairs referencing tasks. Always select the lexicographically smallest currently runnable task. Duplicate edges count once. Raise ValueError for a cycle.",
+    "examples": "tasks=[\"a\",\"b\",\"c\"], dependencies=[(\"a\",\"c\")] → [\"a\",\"b\",\"c\"]",
+    "tests": [
+      {
+        "name": "Deterministic order",
+        "code": "assert build_order([\"c\",\"b\",\"a\"],[(\"a\",\"c\")])==[\"a\",\"b\",\"c\"]"
+      },
+      {
+        "name": "Duplicate edges and disconnected",
+        "code": "assert build_order([\"a\",\"b\",\"c\",\"d\"],[(\"a\",\"b\"),(\"a\",\"b\"),(\"c\",\"d\")])==[\"a\",\"b\",\"c\",\"d\"]; assert build_order([],[])==[]"
+      },
+      {
+        "name": "Cycle",
+        "code": "try: build_order([\"a\",\"b\"],[(\"a\",\"b\"),(\"b\",\"a\")])\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected cycle error\")"
+      },
+      {
+        "name": "Newly runnable lexical priority",
+        "code": "assert build_order([\"a\",\"b\",\"z\"],[(\"a\",\"b\")])==[\"a\",\"b\",\"z\"]"
+      },
+      {
+        "name": "Empty graph and self cycle",
+        "code": "assert build_order([],[])==[]\ntry:build_order([\"a\"],[(\"a\",\"a\")])\nexcept ValueError:pass\nelse:raise AssertionError(\"self cycle accepted\")"
+      }
+    ],
+    "solution": "import heapq\nfrom collections import defaultdict\n\n\ndef build_order(tasks, dependencies):\n    \"\"\"Topologically sort a build graph, breaking ties by name.\n\n    Indegrees say when a task may run; the heap says which of the runnable\n    tasks to pick, so the output is deterministic rather than dependent on\n    dictionary order.\n    \"\"\"\n    edges = defaultdict(set)\n    degree = dict.fromkeys(tasks, 0)\n    for a, b in dependencies:\n        # Deduplicate before counting. Counting a repeated edge twice leaves\n        # the dependent's indegree above zero forever, and a valid graph is\n        # then reported as a cycle.\n        if b not in edges[a]:\n            edges[a].add(b)\n            degree[b] += 1\n\n    ready = [t for t in tasks if degree[t] == 0]\n    heapq.heapify(ready)\n    order = []\n    while ready:\n        task = heapq.heappop(ready)\n        order.append(task)\n        for nxt in edges[task]:\n            degree[nxt] -= 1\n            if degree[nxt] == 0:\n                heapq.heappush(ready, nxt)\n\n    if len(order) != len(tasks):\n        # Something never became runnable, so a cycle blocked it.\n        raise ValueError('Cycle')\n    return order\n",
+    "hints": [
+      "Count unfinished prerequisites.",
+      "A min-heap gives the required tie-breaking."
+    ],
+    "followups": [
+      "Stage 2: execute with N workers and task durations.",
+      "Stage 3: handle failures, retries, cancellation, and dynamic dependencies."
+    ],
+    "complexity": "O(E + V log V) time and O(V+E) space.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "merge",
+    "title": "Merge sharded event streams",
+    "topic": "Heaps",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "def merge_events(streams):\n    pass\n",
+    "statement": "Merge lists of (timestamp, payload) events, each sorted by timestamp. Output a list. Ties use lower stream index first, then original order within that stream. Payload strings must not determine ordering. Aim for O(N log k).",
+    "examples": "[[(1,\"z\"),(3,\"a\")],[(1,\"b\")]] → [(1,\"z\"),(1,\"b\"),(3,\"a\")]",
+    "tests": [
+      {
+        "name": "Stable ties",
+        "code": "assert merge_events([[(1,\"z\"),(1,\"y\")],[(1,\"a\"),(2,\"b\")]])==[(1,\"z\"),(1,\"y\"),(1,\"a\"),(2,\"b\")]"
+      },
+      {
+        "name": "Empty streams",
+        "code": "assert merge_events([[],[(2,\"x\")],[]])==[(2,\"x\")]; assert merge_events([])==[]"
+      },
+      {
+        "name": "Interleaving",
+        "code": "assert merge_events([[(1,\"a\"),(5,\"e\")],[(2,\"b\"),(4,\"d\")],[(3,\"c\")]])==[(1,\"a\"),(2,\"b\"),(3,\"c\"),(4,\"d\"),(5,\"e\")]"
+      },
+      {
+        "name": "Equal timestamps preserve stream priority",
+        "code": "assert merge_events([[(1,\"z\"),(1,\"y\")],[],[(1,\"a\")]])==[(1,\"z\"),(1,\"y\"),(1,\"a\")]"
+      },
+      {
+        "name": "Reference sort across many streams",
+        "code": "import random\nr=random.Random(2); streams=[sorted([(r.randrange(10),str(i)+\":\"+str(j)) for j in range(20)],key=lambda e:e[0]) for i in range(12)]\nexpected=[e for _,_,_,e in sorted((e[0],i,j,e) for i,s in enumerate(streams) for j,e in enumerate(s))]; assert merge_events(streams)==expected"
+      }
+    ],
+    "solution": "import heapq\n\n\ndef merge_events(streams):\n    \"\"\"Merge already-sorted event streams into one timeline.\n\n    This is the k-way merge: hold only the next event from each stream, and\n    the total work is O(N log k) rather than sorting all N events.\n    \"\"\"\n    # The heap holds (timestamp, stream index, position). The stream index is\n    # what breaks ties between equal timestamps, so the payload never enters\n    # the comparison and cannot reorder two shards' events.\n    heap = [(s[0][0], i, 0) for i, s in enumerate(streams) if s]\n    heapq.heapify(heap)\n\n    result = []\n    while heap:\n        _, i, j = heapq.heappop(heap)\n        result.append(streams[i][j])\n        # Replace the drained stream's head with its successor, so each\n        # stream is only ever read once, in order.\n        if j + 1 < len(streams[i]):\n            heapq.heappush(heap, (streams[i][j + 1][0], i, j + 1))\n    return result\n",
+    "hints": [
+      "Keep only the next event from each stream.",
+      "Heap keys must encode the specified tie-break."
+    ],
+    "followups": [
+      "Stage 2: yield results lazily from iterators.",
+      "Stage 3: late events, watermarks, and bounded buffering."
+    ],
+    "complexity": "O(N log k) time; O(k) auxiliary space excluding output.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "paths",
+    "title": "Canonical path resolver",
+    "topic": "Stacks & parsing",
+    "mode": "Build in stages",
+    "minutes": 30,
+    "starter": "def resolve_path(cwd, path):\n    pass\n",
+    "statement": "Resolve a POSIX path against an absolute canonical cwd. Collapse repeated /, ignore ., and process .. without going above root. Absolute paths ignore cwd. Empty path returns cwd. No symlinks or filesystem access.",
+    "examples": "resolve_path(\"/a/b\", \"../c//./\") → \"/a/c\"",
+    "tests": [
+      {
+        "name": "Relative",
+        "code": "assert resolve_path(\"/a/b\",\"../c//./\")==\"/a/c\"; assert resolve_path(\"/a\",\"\")==\"/a\""
+      },
+      {
+        "name": "Absolute and root",
+        "code": "assert resolve_path(\"/a/b\",\"/x/../../y\")==\"/y\"; assert resolve_path(\"/\",\"../../\")==\"/\""
+      },
+      {
+        "name": "Ordinary dot names",
+        "code": "assert resolve_path(\"/a\",\".../.config\")==\"/a/.../.config\""
+      },
+      {
+        "name": "Root clamp and absolute override",
+        "code": "assert resolve_path(\"/a/b\",\"../../../../c\")==\"/c\"; assert resolve_path(\"/a/b\",\"//x/./y/../\")==\"/x\""
+      },
+      {
+        "name": "Dot names are ordinary components",
+        "code": "assert resolve_path(\"/a\",\".../.hidden/..\")==\"/a/...\"; assert resolve_path(\"/\",\" \")==\"/ \""
+      }
+    ],
+    "solution": "def resolve_path(cwd, path):\n    \"\"\"Resolve a path as a shell would, using a component stack.\n\n    Pure string processing: nothing here touches the filesystem or follows a\n    symbolic link.\n    \"\"\"\n    # An absolute path ignores the working directory; a relative one starts\n    # from it.\n    parts = [] if path.startswith('/') else [p for p in cwd.split('/') if p]\n\n    for p in path.split('/'):\n        if p in ('', '.'):\n            # Repeated slashes and no-op components disappear.\n            continue\n        if p == '..':\n            if parts:\n                # `..` at the root is ignored rather than an error, so a\n                # path that walks above the root clamps to `/`.\n                parts.pop()\n        else:\n            parts.append(p)\n\n    return '/' + '/'.join(parts)\n",
+    "hints": [
+      "Use a stack of path components.",
+      "Only exact . and .. have special meaning."
+    ],
+    "followups": [
+      "Stage 2: symbolic links and cycle detection.",
+      "Stage 3: enforce a sandbox root; explain why string prefix checks fail."
+    ],
+    "complexity": "O(len(cwd)+len(path)) time and space.",
+    "difficulty": "Easy"
+  },
+  {
+    "id": "intervals",
+    "title": "Coalesce maintenance windows",
+    "topic": "Sorting & intervals",
+    "mode": "Build in stages",
+    "minutes": 30,
+    "starter": "def merge_windows(windows):\n    pass\n",
+    "statement": "Given half-open integer intervals [start,end) with start < end, return sorted merged intervals as lists. Merge overlapping or touching intervals. Do not modify the input.",
+    "examples": "[[5,7],[1,3],[3,6]] → [[1,7]]",
+    "tests": [
+      {
+        "name": "Touching and nested",
+        "code": "assert merge_windows([[5,7],[1,3],[3,6],[2,4]])==[[1,7]]"
+      },
+      {
+        "name": "Disjoint and empty",
+        "code": "assert merge_windows([[4,5],[1,2]])==[[1,2],[4,5]]; assert merge_windows([])==[]"
+      },
+      {
+        "name": "No mutation",
+        "code": "x=[[3,4],[1,2]]; merge_windows(x); assert x==[[3,4],[1,2]]"
+      },
+      {
+        "name": "Negative, nested and touching windows",
+        "code": "assert merge_windows([[0,2],[-5,-2],[-2,1],[1,1+1]])==[[-5,2]]"
+      },
+      {
+        "name": "Reference coverage and input immutability",
+        "code": "import random,copy\nr=random.Random(9)\nfor _ in range(40):\n a=[[s,s+r.randrange(1,8)] for s in [r.randrange(-10,10) for _ in range(15)]]; old=copy.deepcopy(a); out=merge_windows(a); assert a==old; assert {x for s,e in a for x in range(s,e)}=={x for s,e in out for x in range(s,e)}; assert all(out[i][1]<out[i+1][0] for i in range(len(out)-1))"
+      }
+    ],
+    "solution": "def merge_windows(windows):\n    \"\"\"Coalesce overlapping or touching windows into the smallest set.\n\n    Sorting first is what makes this a single pass: after that, a window can\n    only ever extend the one before it.\n    \"\"\"\n    result = []\n    for start, end in sorted(windows):\n        # <= rather than <, because touching windows share no instant and\n        # still belong in one merged window.\n        if result and start <= result[-1][1]:\n            result[-1][1] = max(result[-1][1], end)\n        else:\n            result.append([start, end])\n    return result\n",
+    "hints": [
+      "Sort by start time.",
+      "Only the final output interval can overlap the next input."
+    ],
+    "followups": [
+      "Stage 2: return gaps within a requested range.",
+      "Stage 3: support online insertion and deletion of windows."
+    ],
+    "complexity": "O(n log n) time; O(n) space.",
+    "difficulty": "Easy"
+  },
+  {
+    "id": "peak",
+    "title": "Peak concurrent requests",
+    "topic": "Sweep line",
+    "mode": "Think before coding",
+    "minutes": 30,
+    "starter": "def peak_concurrency(intervals):\n    pass\n",
+    "statement": "Return maximum simultaneous requests from half-open [start,end) intervals. Zero-length intervals are ignored; start <= end. A request ending at t does not overlap one starting at t.",
+    "examples": "[(1,3),(3,5),(2,4)] → 2",
+    "tests": [
+      {
+        "name": "Boundary",
+        "code": "assert peak_concurrency([(1,3),(3,5),(2,4)])==2"
+      },
+      {
+        "name": "Zero and empty",
+        "code": "assert peak_concurrency([(1,1)])==0; assert peak_concurrency([])==0"
+      },
+      {
+        "name": "Burst and duplicates",
+        "code": "assert peak_concurrency([(0,10),(0,10),(5,6)])==3"
+      },
+      {
+        "name": "Coincident end and start with zero length",
+        "code": "assert peak_concurrency([[0,2],[0,2],[2,4],[2,2]])==2; assert peak_concurrency([[5,5]])==0"
+      },
+      {
+        "name": "Reference scan over integer time",
+        "code": "import random\nr=random.Random(3)\nfor _ in range(60):\n a=[sorted([r.randrange(-8,9),r.randrange(-8,9)]) for _ in range(20)]; assert peak_concurrency(a)==max(sum(s<=t<e for s,e in a) for t in range(-8,9))"
+      }
+    ],
+    "solution": "def peak_concurrency(intervals):\n    \"\"\"The largest number of half-open intervals overlapping at any instant.\"\"\"\n    # Each interval becomes a plus at its start and a minus at its end. A\n    # sweep over these points is O(n log n) and needs no sorting of the\n    # intervals themselves.\n    changes = {}\n    for start, end in intervals:\n        changes[start] = changes.get(start, 0) + 1\n        changes[end] = changes.get(end, 0) - 1\n\n    current = 0\n    best = 0\n    for t in sorted(changes):\n        # A start and an end sharing a timestamp land in the same bucket, so\n        # a request ending at t and one starting at t cancel out and are not\n        # counted as overlapping.\n        current += changes[t]\n        best = max(best, current)\n    return best\n",
+    "hints": [
+      "Aggregate changes at the same timestamp.",
+      "Half-open intervals require ends and starts to balance before measuring."
+    ],
+    "followups": [
+      "Stage 2: return every time range attaining the peak.",
+      "Stage 3: estimate capacity for a streaming input."
+    ],
+    "complexity": "O(n log n) time; O(n) space.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "bfs",
+    "title": "Shortest service route",
+    "topic": "Graphs",
+    "mode": "Build in stages",
+    "minutes": 30,
+    "starter": "def shortest_route(graph, source, target):\n    pass\n",
+    "statement": "graph maps service names to lists of directed neighbors. Return minimum hop count from source to target, or -1 if unreachable. A node missing as a key has no outgoing edges. source == target returns 0.",
+    "examples": "{\"a\":[\"b\"],\"b\":[\"c\"]}, a→c → 2",
+    "tests": [
+      {
+        "name": "Shortest path",
+        "code": "assert shortest_route({\"a\":[\"b\",\"c\"],\"b\":[\"d\"],\"c\":[\"e\"],\"e\":[\"d\"]},\"a\",\"d\")==2"
+      },
+      {
+        "name": "Cycle and unreachable",
+        "code": "assert shortest_route({\"a\":[\"b\"],\"b\":[\"a\"]},\"a\",\"z\")==-1"
+      },
+      {
+        "name": "Same node and sink",
+        "code": "assert shortest_route({},\"a\",\"a\")==0; assert shortest_route({\"a\":[\"b\"]},\"a\",\"b\")==1"
+      },
+      {
+        "name": "Directed cycles and missing nodes",
+        "code": "g={\"a\":[\"b\",\"b\"],\"b\":[\"a\",\"c\"]}; assert shortest_route(g,\"a\",\"c\")==2; assert shortest_route(g,\"c\",\"a\")==-1; assert shortest_route({},\"z\",\"z\")==0"
+      },
+      {
+        "name": "Shorter route discovered beside long route",
+        "code": "assert shortest_route({\"a\":[\"b\",\"z\"],\"b\":[\"c\"],\"c\":[\"d\"],\"d\":[\"t\"],\"z\":[\"t\"]},\"a\",\"t\")==2"
+      }
+    ],
+    "solution": "from collections import deque\n\n\ndef shortest_route(graph, source, target):\n    \"\"\"The fewest hops from source to target, or -1 if unreachable.\n\n    Breadth-first search is enough here because every edge costs the same, so\n    the first time a node is reached it has been reached optimally.\n    \"\"\"\n    # The queue holds (node, distance) so no separate level-by-level loop is\n    # needed.\n    q = deque([(source, 0)])\n    seen = {source}\n    while q:\n        node, distance = q.popleft()\n        if node == target:\n            return distance\n        # A node missing as a key has no outgoing edges, so the lookup has to\n        # tolerate absence.\n        for nxt in graph.get(node, []):\n            if nxt not in seen:\n                # Marked on enqueue, not on dequeue, so a node is never\n                # queued twice and the search cannot revisit a cycle.\n                seen.add(nxt)\n                q.append((nxt, distance + 1))\n    return -1\n",
+    "hints": [
+      "BFS explores by increasing hop count.",
+      "Mark visited when enqueuing."
+    ],
+    "followups": [
+      "Stage 2: return an actual shortest path.",
+      "Stage 3: weighted nonnegative latency requires Dijkstra; discuss failures during routing."
+    ],
+    "complexity": "O(V+E) time; O(V) space.",
+    "difficulty": "Easy"
+  },
+  {
+    "id": "trie",
+    "title": "Command autocomplete",
+    "topic": "Trees & tries",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "class Autocomplete:\n    def add(self, word):\n        pass\n\n    def suggest(self, prefix, k):\n        pass\n",
+    "statement": "Add lowercase ASCII words, including duplicates. suggest returns at most k distinct words starting with prefix in lexicographic order. Empty prefix matches all words; k <= 0 returns []. Design for repeated prefix queries.",
+    "examples": "add(\"cat\"), add(\"car\"), add(\"cat\"); suggest(\"ca\",2) → [\"car\",\"cat\"]",
+    "tests": [
+      {
+        "name": "Prefix and dedupe",
+        "code": "a=Autocomplete(); [a.add(w) for w in [\"cat\",\"car\",\"dog\",\"cat\"]]; assert a.suggest(\"ca\",2)==[\"car\",\"cat\"]"
+      },
+      {
+        "name": "Exact word and empty prefix",
+        "code": "a=Autocomplete(); [a.add(w) for w in [\"a\",\"ab\",\"b\"]]; assert a.suggest(\"a\",4)==[\"a\",\"ab\"]; assert a.suggest(\"\",2)==[\"a\",\"ab\"]"
+      },
+      {
+        "name": "Missing and zero",
+        "code": "a=Autocomplete(); a.add(\"a\"); assert a.suggest(\"z\",3)==[]; assert a.suggest(\"\",0)==[]"
+      },
+      {
+        "name": "Duplicate words and lexical prefix",
+        "code": "a=Autocomplete()\nfor w in [\"a\",\"ab\",\"a\",\"abc\",\"b\"]:a.add(w)\nassert a.suggest(\"a\",10)==[\"a\",\"ab\",\"abc\"]; assert a.suggest(\"\",0)==[]; assert a.suggest(\"z\",3)==[]"
+      },
+      {
+        "name": "Reference sorted set queries",
+        "code": "a=Autocomplete(); words=[\"cat\",\"car\",\"cart\",\"dog\",\"door\",\"cat\",\"cab\"]\nfor w in words:a.add(w)\nfor prefix in [\"\",\"c\",\"ca\",\"car\",\"d\",\"z\"]:\n for k in [-1,1,2,20]:assert a.suggest(prefix,k)==(sorted({w for w in words if w.startswith(prefix)})[:k] if k>0 else [])"
+      }
+    ],
+    "solution": "class Autocomplete:\n    \"\"\"Prefix search over a dictionary, backed by a trie.\n\n    A trie shares the common prefix between words instead of comparing every\n    word from the start, so a query costs the length of the prefix.\n    \"\"\"\n\n    def __init__(self):\n        self.root = {}\n\n    def add(self, word):\n        node = self.root\n        for c in word:\n            # setdefault builds a path in one expression; a child dict is a\n            # node, and None marks a word that ends here.\n            node = node.setdefault(c, {})\n        node[None] = True\n\n    def suggest(self, prefix, k):\n        if k <= 0:\n            return []\n        # Walk the prefix once. A prefix that is not a path has no matches.\n        node = self.root\n        for c in prefix:\n            if c not in node:\n                return []\n            node = node[c]\n\n        result = []\n        # An explicit stack, because the recursion depth would be the length\n        # of the longest word.\n        stack = [(node, prefix)]\n        while stack and len(result) < k:\n            current, word = stack.pop()\n            if None in current:\n                # A word can be reached by more than one path, so it is\n                # deduplicated by only ever being appended from its own node.\n                result.append(word)\n            # Pushed in reverse so the stack pops them in ascending order,\n            # which is what makes the output lexicographic.\n            for c in sorted((c for c in current if c is not None), reverse=True):\n                stack.append((current[c], word + c))\n        return result\n",
+    "hints": [
+      "A trie shares common prefixes.",
+      "Visit terminal words before their extensions."
+    ],
+    "followups": [
+      "Stage 2: rank by frequency with deterministic ties.",
+      "Stage 3: delete words and handle Unicode normalization."
+    ],
+    "complexity": "Insert O(word length); query O(prefix length + visited traversal and string construction); storage O(total characters).",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "dp",
+    "title": "Minimum-cost token segmentation",
+    "topic": "Dynamic programming",
+    "mode": "Think before coding",
+    "minutes": 45,
+    "starter": "def min_token_cost(text, costs):\n    pass\n",
+    "statement": "costs maps nonempty token strings to nonnegative integer costs. Segment all of text into known tokens, minimizing total cost. Tokens may be reused. Return -1 if impossible; empty text costs 0.",
+    "examples": "text=\"aaaa\", costs={\"a\":2,\"aa\":3} → 6",
+    "tests": [
+      {
+        "name": "Greedy trap",
+        "code": "assert min_token_cost(\"abcd\",{\"abc\":1,\"ab\":3,\"cd\":2,\"d\":9})==5"
+      },
+      {
+        "name": "Repeated and impossible",
+        "code": "assert min_token_cost(\"aaaa\",{\"a\":2,\"aa\":3})==6; assert min_token_cost(\"ab\",{\"a\":1})==-1"
+      },
+      {
+        "name": "Empty and zero cost",
+        "code": "assert min_token_cost(\"\",{})==0; assert min_token_cost(\"aa\",{\"a\":0})==0"
+      },
+      {
+        "name": "Zero cost and greedy trap",
+        "code": "assert min_token_cost(\"aaaa\",{\"a\":2,\"aaa\":3,\"aa\":1})==2; assert min_token_cost(\"aaa\",{\"a\":0})==0"
+      },
+      {
+        "name": "Unsegmentable suffix and empty vocabulary",
+        "code": "assert min_token_cost(\"ab\",{\"a\":0})==-1; assert min_token_cost(\"\",{})==0; assert min_token_cost(\"x\",{})==-1"
+      }
+    ],
+    "solution": "def min_token_cost(text, costs):\n    \"\"\"The cheapest way to segment text into known tokens, or -1.\"\"\"\n    # dp[i] is the cheapest way to cover the first i characters. Building\n    # forwards, each reachable position extends into every token that starts\n    # there, so every segmentation is considered exactly once.\n    dp = [float('inf')] * (len(text) + 1)\n    dp[0] = 0\n    for i in range(len(text)):\n        if dp[i] == float('inf'):\n            # Unreachable prefix: nothing to extend from.\n            continue\n        for token, cost in costs.items():\n            if text.startswith(token, i):\n                j = i + len(token)\n                dp[j] = min(dp[j], dp[i] + cost)\n    # An unreachable marker that is merely very large would turn an\n    # impossible segmentation into a plausible-looking cost.\n    return -1 if dp[-1] == float('inf') else dp[-1]\n",
+    "hints": [
+      "Define dp[i] as the best cost for the first i characters.",
+      "Cheapest local token can prevent the best full segmentation."
+    ],
+    "followups": [
+      "Stage 2: reconstruct the chosen tokens.",
+      "Stage 3: optimize dictionary lookup with a trie."
+    ],
+    "complexity": "O(n × sum of token lengths) time upper bound; O(n) DP space.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "backtrack",
+    "title": "Assign jobs to bounded workers",
+    "topic": "Backtracking",
+    "mode": "Think before coding",
+    "minutes": 45,
+    "starter": "def can_assign(jobs, capacities):\n    pass\n",
+    "statement": "Return whether every indivisible job can be assigned to one worker without exceeding that worker capacity. Jobs and capacities are nonnegative integers; empty jobs succeeds. Do not mutate inputs. Target small inputs (at most 12 jobs, 6 workers).",
+    "examples": "jobs=[4,3,3], capacities=[6,4] → True",
+    "tests": [
+      {
+        "name": "Needs search",
+        "code": "assert can_assign([4,3,3],[6,4]) is True; assert can_assign([4,4,4],[6,6]) is False"
+      },
+      {
+        "name": "Empty and impossible",
+        "code": "assert can_assign([],[]) is True; assert can_assign([1],[]) is False; assert can_assign([7],[6]) is False"
+      },
+      {
+        "name": "No mutation",
+        "code": "a=[2,3]; b=[3,2]; assert can_assign(a,b); assert a==[2,3] and b==[3,2]"
+      },
+      {
+        "name": "Zero jobs still need a worker",
+        "code": "assert can_assign([],[]); assert not can_assign([0],[]); assert can_assign([0,0],[0])"
+      },
+      {
+        "name": "Search backtracking and immutable inputs",
+        "code": "jobs=[4,3,3,2]; caps=[6,6]; assert can_assign(jobs,caps); assert jobs==[4,3,3,2] and caps==[6,6]; assert not can_assign([3,3,3],[5,4])"
+      }
+    ],
+    "solution": "def can_assign(jobs, capacities):\n    \"\"\"Whether every job fits whole into some machine's remaining capacity.\"\"\"\n    # Largest first, so the search fails fast on the tightest decisions.\n    work = sorted(jobs, reverse=True)\n    remaining = list(capacities)\n    if sum(work) > sum(remaining):\n        # A total-capacity shortfall cannot be fixed by any arrangement.\n        return False\n\n    def search(i):\n        if i == len(work):\n            return True\n        tried = set()\n        for w, capacity in enumerate(remaining):\n            if capacity < work[i] or capacity in tried:\n                # A job goes to exactly one machine, and two machines with\n                # equal remaining capacity lead to identical subtrees.\n                continue\n            tried.add(capacity)\n            remaining[w] -= work[i]\n            if search(i + 1):\n                remaining[w] += work[i]\n                return True\n            # Undo before trying the next machine.\n            remaining[w] += work[i]\n        return False\n\n    return search(0)\n",
+    "hints": [
+      "Place large jobs first.",
+      "Undo each choice; skip workers with identical remaining capacities."
+    ],
+    "followups": [
+      "Stage 2: return the assignment and minimize the largest load.",
+      "Stage 3: compare heuristics with exact search at large scale."
+    ],
+    "complexity": "O(k^n) search worst case plus sorting; O(n+k) recursion/state.",
+    "difficulty": "Hard"
+  },
+  {
+    "id": "dedupe",
+    "title": "Idempotent event aggregation",
+    "topic": "Maps & sets",
+    "mode": "Build in stages",
+    "minutes": 30,
+    "starter": "def aggregate_events(events):\n    pass\n",
+    "statement": "Each event is a dict with id, account, amount (integer). First occurrence of an id wins globally, even if a duplicate has different data. Return account → sum of amounts for accepted events. Negative and zero amounts are valid.",
+    "examples": "[{id:x, account:a, amount:3}, duplicate x] → {a:3}",
+    "tests": [
+      {
+        "name": "Duplicates and conflict",
+        "code": "assert aggregate_events([{\"id\":\"x\",\"account\":\"a\",\"amount\":3},{\"id\":\"x\",\"account\":\"b\",\"amount\":9},{\"id\":\"y\",\"account\":\"a\",\"amount\":-1}])=={\"a\":2}"
+      },
+      {
+        "name": "Zero and empty",
+        "code": "assert aggregate_events([])=={}; assert aggregate_events([{\"id\":\"x\",\"account\":\"a\",\"amount\":0}])=={\"a\":0}"
+      },
+      {
+        "name": "Global identity despite changed account",
+        "code": "e=[{\"id\":\"x\",\"account\":\"a\",\"amount\":0},{\"id\":\"x\",\"account\":\"b\",\"amount\":50},{\"id\":\"y\",\"account\":\"a\",\"amount\":-3}]; assert aggregate_events(e)=={\"a\":-3}"
+      },
+      {
+        "name": "Empty input and cancellation to zero",
+        "code": "assert aggregate_events([])=={}; assert aggregate_events([{\"id\":1,\"account\":\"a\",\"amount\":3},{\"id\":2,\"account\":\"a\",\"amount\":-3}])=={\"a\":0}"
+      }
+    ],
+    "solution": "def aggregate_events(events):\n    \"\"\"Sum amounts per account, counting each event id exactly once.\"\"\"\n    seen = set()\n    totals = {}\n    for event in events:\n        if event['id'] in seen:\n            # The first occurrence of an id wins outright. A later duplicate\n            # carrying a different account or amount is ignored completely\n            # rather than merged, or one event is counted under two accounts.\n            continue\n        seen.add(event['id'])\n        a = event['account']\n        totals[a] = totals.get(a, 0) + event['amount']\n    return totals\n",
+    "hints": [
+      "Deduplicate before touching totals.",
+      "IDs are global, not per account."
+    ],
+    "followups": [
+      "Stage 2: streaming updates and bounded deduplication retention.",
+      "Stage 3: crash between recording the ID and updating the total; design an atomic write."
+    ],
+    "complexity": "O(n) time; O(unique IDs + accounts) space.",
+    "difficulty": "Easy"
+  },
+  {
+    "id": "window",
+    "title": "Longest bounded-distinct activity",
+    "topic": "Queues & windows",
+    "mode": "Build in stages",
+    "minutes": 30,
+    "starter": "def longest_activity(events, k):\n    pass\n",
+    "statement": "Return the length of the longest contiguous subarray containing at most k distinct string event types. k <= 0 returns 0.",
+    "examples": "[\"a\",\"b\",\"a\",\"c\"], k=2 → 3",
+    "tests": [
+      {
+        "name": "Shrinking window",
+        "code": "assert longest_activity([\"a\",\"b\",\"a\",\"c\"],2)==3; assert longest_activity([\"a\",\"b\",\"c\",\"b\",\"b\"],2)==4"
+      },
+      {
+        "name": "Empty and zero",
+        "code": "assert longest_activity([],2)==0; assert longest_activity([\"a\"],0)==0"
+      },
+      {
+        "name": "All equal",
+        "code": "assert longest_activity([\"x\"]*100,1)==100"
+      },
+      {
+        "name": "Empty input and nonpositive k",
+        "code": "assert longest_activity([],3)==0; assert longest_activity([\"a\"],-1)==0; assert longest_activity([\"a\",\"a\"],1)==2"
+      },
+      {
+        "name": "Brute-force comparison over random inputs",
+        "code": "import random\nr=random.Random(4)\nfor _ in range(100):\n a=[r.choice(\"abc\") for _ in range(r.randrange(12))]; k=r.randrange(4); want=max([0]+[j-i for i in range(len(a)) for j in range(i+1,len(a)+1) if len(set(a[i:j]))<=k]); assert longest_activity(a,k)==want"
+      }
+    ],
+    "solution": "def longest_activity(events, k):\n    \"\"\"The longest contiguous run of events covering at most k distinct types.\"\"\"\n    if k <= 0:\n        return 0\n    counts = {}\n    left = 0\n    best = 0\n    for right, event in enumerate(events):\n        counts[event] = counts.get(event, 0) + 1\n        # Shrink from the left until the window holds at most k distinct\n        # types. A type whose count reaches zero leaves the window entirely,\n        # which can make the window valid and longer again without the right\n        # edge moving.\n        while len(counts) > k:\n            old = events[left]\n            counts[old] -= 1\n            if counts[old] == 0:\n                del counts[old]\n            left += 1\n        # The left edge never moves backwards, so every position is\n        # considered once and the window is O(n) overall.\n        best = max(best, right - left + 1)\n    return best\n",
+    "hints": [
+      "Maintain counts within a moving window.",
+      "Shrink until the invariant is restored, not just one step."
+    ],
+    "followups": [
+      "Stage 2: return indices with earliest-start tie breaking.",
+      "Stage 3: adapt to a timestamp window on an unbounded stream."
+    ],
+    "complexity": "O(n) time; O(min(n,k+1)) space.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "parser",
+    "title": "Incremental message decoder",
+    "topic": "Stacks & parsing",
+    "mode": "Think before coding",
+    "minutes": 60,
+    "starter": "class Decoder:\n    def feed(self, chunk):\n        pass\n",
+    "statement": "Decode length-prefixed ASCII frames of the form decimal_length:payload. feed accepts a chunk and returns all complete payload strings newly decoded, retaining incomplete data. Empty payloads are valid. Input is a valid stream; lengths have no leading zeros except 0. Chunks can split headers and bodies.",
+    "examples": "feed(\"5:he\") → []; feed(\"llo0:3:bye\") → [\"hello\",\"\",\"bye\"]",
+    "tests": [
+      {
+        "name": "Split header and payload",
+        "code": "d=Decoder(); assert d.feed(\"1\")==[]; assert d.feed(\"0:abc\")==[]; assert d.feed(\"defghij\")==[\"abcdefghij\"]"
+      },
+      {
+        "name": "Multiple and empty",
+        "code": "d=Decoder(); assert d.feed(\"5:he\")==[]; assert d.feed(\"llo0:3:bye\")==[\"hello\",\"\",\"bye\"]"
+      },
+      {
+        "name": "Colon payload and empty chunk",
+        "code": "d=Decoder(); assert d.feed(\"3:a:b\")==[\"a:b\"]; assert d.feed(\"\")==[]"
+      },
+      {
+        "name": "Every character separately including colons",
+        "code": "d=Decoder(); result=[]\nfor c in \"0:3:a:b1:z0:\":result+=d.feed(c)\nassert result==[\"\",\"a:b\",\"z\",\"\"]; assert d.feed(\"\")==[]"
+      },
+      {
+        "name": "Every two-chunk split",
+        "code": "raw=\"12:hello world!0:1:x\"\nfor i in range(len(raw)+1):\n d=Decoder(); assert d.feed(raw[:i])+d.feed(raw[i:])==[\"hello world!\",\"\",\"x\"]"
+      }
+    ],
+    "solution": "class Decoder:\n    \"\"\"Decodes `<length>:<payload>` frames from an arbitrarily chunked stream.\"\"\"\n\n    def __init__(self):\n        self.buffer = ''\n\n    def feed(self, chunk):\n        # A chunk boundary can fall anywhere, so whatever has arrived but is\n        # not yet a complete frame is carried into the next call.\n        self.buffer += chunk\n        result = []\n        while True:\n            colon = self.buffer.find(':')\n            if colon < 0:\n                # No header yet. Whatever is buffered is an incomplete one.\n                break\n            length = int(self.buffer[:colon])\n            end = colon + 1 + length\n            if len(self.buffer) < end:\n                # The header is complete but the payload has not all arrived.\n                break\n            result.append(self.buffer[colon + 1:end])\n            # Only consumed frames are dropped, so the partial tail survives.\n            self.buffer = self.buffer[end:]\n        return result\n",
+    "hints": [
+      "Separate incomplete headers from incomplete bodies.",
+      "A colon inside a payload is ordinary data."
+    ],
+    "followups": [
+      "Stage 2: reject malformed or oversized frames.",
+      "Stage 3: avoid quadratic copying with byte buffers and an explicit parsing cursor."
+    ],
+    "complexity": "Simple reference can be O(N²) under fragmentation/copying; O(buffered input + output) space. Explain an amortized linear improvement.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "debug",
+    "title": "Repair a retry loop",
+    "topic": "Debugging",
+    "mode": "Debug existing code",
+    "minutes": 30,
+    "starter": "def retry(operation, attempts, retry_on=(TimeoutError,)):\n    # Existing implementation: find and fix its bugs.\n    for _ in range(attempts + 1):\n        try:\n            result = operation()\n            if result:\n                return result\n        except Exception:\n            continue\n    return None\n",
+    "statement": "Fix the supplied retry implementation. attempts is total calls allowed, not extra retries, and must be >=1 or raise ValueError. Return immediately on success, including None/0/False. Retry only exceptions in retry_on; re-raise the last exception when exhausted. Other exceptions propagate immediately.",
+    "examples": "An operation failing twice then returning 0 succeeds with attempts=3.",
+    "tests": [
+      {
+        "name": "Falsey success",
+        "code": "calls=[]\ndef op():\n    calls.append(1); return 0\nassert retry(op,3)==0 and len(calls)==1"
+      },
+      {
+        "name": "Eventual success",
+        "code": "calls=[]\ndef op():\n    calls.append(1)\n    if len(calls)<3: raise TimeoutError(\"wait\")\n    return \"ok\"\nassert retry(op,3)==\"ok\" and len(calls)==3"
+      },
+      {
+        "name": "Exhaustion and invalid attempts",
+        "code": "calls=[]\ndef op():\n    calls.append(1); raise TimeoutError(\"last\")\ntry: retry(op,2)\nexcept TimeoutError as e: assert str(e)==\"last\"\nelse: raise AssertionError(\"Expected error\")\nassert len(calls)==2\ntry: retry(op,0)\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")"
+      },
+      {
+        "name": "Nonretryable error",
+        "code": "calls=[]\ndef op():\n    calls.append(1); raise KeyError(\"bad\")\ntry: retry(op,5)\nexcept KeyError: pass\nelse: raise AssertionError(\"Expected KeyError\")\nassert len(calls)==1"
+      },
+      {
+        "name": "Falsy successes call operation only once",
+        "code": "for value in [None,0,False,\"\"]:\n calls=[]\n def op():calls.append(1); return value\n assert retry(op,3) is value; assert len(calls)==1"
+      },
+      {
+        "name": "Original exception and exact attempt budget",
+        "code": "calls=[]; error=TimeoutError(\"original\")\ndef op():calls.append(1); raise error\ntry:retry(op,2)\nexcept TimeoutError as e:assert e is error\nelse:raise AssertionError(\"error swallowed\")\nassert len(calls)==2"
+      }
+    ],
+    "solution": "def retry(operation, attempts, retry_on=(TimeoutError,)):\n    \"\"\"Call an operation, retrying only the given exception types.\"\"\"\n    if attempts < 1:\n        raise ValueError('attempts must be positive')\n    for i in range(attempts):\n        try:\n            # The result is returned directly. None, 0, False and the empty\n            # string are all successful answers, so the truthiness of what\n            # came back must never decide whether this call succeeded.\n            return operation()\n        except retry_on:\n            if i == attempts - 1:\n                # The last retryable failure re-raises the original error, so\n                # the caller can see why it kept failing.\n                raise\n",
+    "hints": [
+      "Successful return values do not need to be truthy.",
+      "Separate exception filtering from attempt counting."
+    ],
+    "followups": [
+      "Stage 2: injected sleep, exponential backoff, jitter, and a deadline.",
+      "Stage 3: when is retrying a write unsafe? Add idempotency."
+    ],
+    "complexity": "O(attempts) calls, O(1) auxiliary space.",
+    "difficulty": "Easy"
+  },
+  {
+    "id": "async",
+    "title": "Bounded asynchronous map",
+    "topic": "Async & coordination",
+    "mode": "Think before coding",
+    "minutes": 60,
+    "starter": "async def bounded_map(items, fn, limit):\n    pass\n",
+    "statement": "Apply async fn to each item with at most limit concurrent calls. Return results in input order, not completion order. limit must be >=1. On failure, cancel and await unfinished work before propagating the error. Tests use asyncio without threads. Use top-level await for your scratch calls in the browser.",
+    "examples": "await bounded_map([3,1,2], double_async, 2) → [6,2,4]",
+    "tests": [
+      {
+        "name": "Ordering and concurrency",
+        "code": "import asyncio\nactive=0; peak=0\nasync def fn(x):\n    global active,peak\n    active+=1; peak=max(peak,active)\n    await asyncio.sleep(0.001*(4-x))\n    active-=1\n    return x*2\nassert await bounded_map([3,1,2],fn,2)==[6,2,4]\nassert peak==2 and active==0"
+      },
+      {
+        "name": "Empty and invalid limit",
+        "code": "async def fn(x): return x\nassert await bounded_map([],fn,1)==[]\ntry: await bounded_map([1],fn,0)\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")"
+      },
+      {
+        "name": "Failure cleans up",
+        "code": "import asyncio\nactive=0\nasync def fn(x):\n    global active\n    active+=1\n    try:\n        if x==1:\n            await asyncio.sleep(0)\n            raise RuntimeError(\"boom\")\n        await asyncio.sleep(0.03)\n        return x\n    finally: active-=1\ntry: await bounded_map([0,1,2],fn,2)\nexcept RuntimeError: pass\nelse: raise AssertionError(\"Expected RuntimeError\")\nassert active==0"
+      },
+      {
+        "name": "Empty input and invalid limit",
+        "code": "async def f(x):return x\nassert await bounded_map([],f,1)==[]\ntry:await bounded_map([1],f,0)\nexcept ValueError:pass\nelse:raise AssertionError(\"invalid limit accepted\")"
+      },
+      {
+        "name": "Order and concurrency limit under yielding work",
+        "code": "import asyncio\nactive=0; peak=0\nasync def f(x):\n global active,peak\n active+=1; peak=max(peak,active); await asyncio.sleep(0); active-=1; return x*x\nassert await bounded_map(list(range(30)),f,3)==[i*i for i in range(30)]; assert peak<=3; assert active==0"
+      }
+    ],
+    "solution": "import asyncio\n\n\nasync def bounded_map(items, fn, limit):\n    \"\"\"Map an async function over items, at most `limit` calls at a time.\"\"\"\n    if limit < 1:\n        raise ValueError('limit must be positive')\n    # A semaphore bounds the calls in flight without changing the shape of\n    # the result.\n    semaphore = asyncio.Semaphore(limit)\n\n    async def run(item):\n        async with semaphore:\n            return await fn(item)\n\n    tasks = [asyncio.create_task(run(item)) for item in items]\n    try:\n        # gather preserves input order, so the results line up with `items`\n        # rather than with completion order.\n        return await asyncio.gather(*tasks)\n    except BaseException:\n        # gather does not stop the others when one raises, so cancel them and\n        # then await them. Cancelling without awaiting would leave work\n        # running after this call has returned.\n        for task in tasks:\n            task.cancel()\n        await asyncio.gather(*tasks, return_exceptions=True)\n        raise\n",
+    "hints": [
+      "A semaphore limits active calls but not allocated tasks.",
+      "gather preserves input order; handle failure cleanup explicitly."
+    ],
+    "followups": [
+      "Stage 2: use a fixed worker pool so task count is O(limit).",
+      "Stage 3: streaming backpressure, per-item timeout, and caller cancellation.",
+      "Explain why asyncio does not make CPU-bound work parallel."
+    ],
+    "complexity": "O(n) task/result storage; at most limit active fn calls; runtime depends on task latency.",
+    "difficulty": "Hard"
+  },
+  {
+    "id": "credits",
+    "title": "Expiring credit ledger",
+    "topic": "State & time",
+    "mode": "Think before coding",
+    "minutes": 60,
+    "starter": "class CreditLedger:\n    def grant(self, amount, now, ttl):\n        pass\n\n    def spend(self, amount, now):\n        pass\n\n    def balance(self, now):\n        pass\n",
+    "statement": "Model credits with nonnegative integer grants and positive ttl. Timestamps are globally nondecreasing. Grant expires at now+ttl (exclusive). spend returns False with no credit consumption if funds are insufficient; otherwise consumes earliest-expiring credits first and returns True. amount is nonnegative.",
+    "examples": "grant 5 at 0 ttl 10; grant 4 at 1 ttl 2; spend 3 at 2; balance at 3 → 5",
+    "tests": [
+      {
+        "name": "Earliest expiry",
+        "code": "l=CreditLedger(); l.grant(5,0,10); l.grant(4,1,2); assert l.spend(3,2); assert l.balance(3)==5"
+      },
+      {
+        "name": "Atomic insufficient spend",
+        "code": "l=CreditLedger(); l.grant(3,0,10); assert not l.spend(4,1); assert l.balance(1)==3; assert l.spend(3,2); assert l.balance(2)==0"
+      },
+      {
+        "name": "Exact expiry and zero",
+        "code": "l=CreditLedger(); l.grant(2,1,2); assert l.balance(3)==0; assert l.spend(0,3); assert not l.spend(1,3)"
+      },
+      {
+        "name": "Failed spending consumes nothing",
+        "code": "s=CreditLedger(); s.grant(3,0,2); s.grant(5,0,10); assert not s.spend(9,1); assert s.balance(1)==8; assert s.spend(3,1); assert s.balance(2)==5"
+      },
+      {
+        "name": "Zero grants and exact expiry",
+        "code": "s=CreditLedger(); assert s.spend(0,0); s.grant(0,0,2); s.grant(1,0,2); assert s.balance(2)==0; assert not s.spend(1,2)"
+      }
+    ],
+    "solution": "import heapq\n\n\nclass CreditLedger:\n    \"\"\"A balance of credit that expires grant by grant.\n\n    Grants are kept in a heap by expiry, so expiring them and spending the\n    soonest-to-expire first are both the cheapest possible operation.\n    \"\"\"\n\n    def __init__(self):\n        # (expiry, amount), soonest first.\n        self.grants = []\n        self.total = 0\n\n    def _expire(self, now):\n        # Lazy expiry: nothing is removed until an operation looks at it.\n        while self.grants and self.grants[0][0] <= now:\n            _, amount = heapq.heappop(self.grants)\n            self.total -= amount\n\n    def grant(self, amount, now, ttl):\n        self._expire(now)\n        if amount:\n            heapq.heappush(self.grants, (now + ttl, amount))\n            self.total += amount\n\n    def balance(self, now):\n        self._expire(now)\n        return self.total\n\n    def spend(self, amount, now):\n        self._expire(now)\n        if amount > self.total:\n            # Refused, and so consumes nothing at all. Taking what is\n            # available and only then discovering you are short would leave\n            # the balance permanently drained by a spend that never happened.\n            return False\n        self.total -= amount\n        # Spend the soonest-to-expire credit first, which keeps long-lived\n        # grants alive for later. A grant can be split across two spends, so\n        # a partly used one is pushed back with the remainder.\n        while amount:\n            expiry, available = heapq.heappop(self.grants)\n            used = min(amount, available)\n            amount -= used\n            if available > used:\n                heapq.heappush(self.grants, (expiry, available - used))\n        return True\n",
+    "hints": [
+      "Check the full balance before consuming anything.",
+      "A heap orders grants by expiry, not creation time."
+    ],
+    "followups": [
+      "Stage 2: accept retroactive events and historical queries.",
+      "Stage 3: refunds linked to grants, durable audit log, concurrent spending."
+    ],
+    "complexity": "grant O(log n); spend/expiry O(k log n) for k touched grants; O(n) space.",
+    "difficulty": "Hard"
+  },
+  {
+    "id": "topk",
+    "title": "Top error signatures",
+    "topic": "Heaps",
+    "mode": "Build in stages",
+    "minutes": 30,
+    "starter": "def top_errors(errors, k):\n    pass\n",
+    "statement": "Return the k most frequent distinct error strings, ordered by descending frequency then lexicographically ascending. k <= 0 returns []. k may exceed the number of distinct errors.",
+    "examples": "[\"b\",\"a\",\"b\",\"a\",\"c\"], k=2 → [\"a\",\"b\"]",
+    "tests": [
+      {
+        "name": "Tie order",
+        "code": "assert top_errors([\"b\",\"a\",\"b\",\"a\",\"c\"],2)==[\"a\",\"b\"]"
+      },
+      {
+        "name": "Bounds",
+        "code": "assert top_errors([],3)==[]; assert top_errors([\"x\"],0)==[]; assert top_errors([\"z\",\"a\"],10)==[\"a\",\"z\"]"
+      },
+      {
+        "name": "Lexical ties and oversized k",
+        "code": "assert top_errors([\"z\",\"a\",\"z\",\"a\",\"b\"],99)==[\"a\",\"z\",\"b\"]; assert top_errors([],2)==[]"
+      },
+      {
+        "name": "Reference frequency ordering",
+        "code": "import random\nfrom collections import Counter\nr=random.Random(5)\nfor _ in range(80):\n a=[r.choice(\"abcde\") for _ in range(r.randrange(30))]; k=r.randrange(-2,8); c=Counter(a); assert top_errors(a,k)==(sorted(c,key=lambda x:(-c[x],x))[:k] if k>0 else [])"
+      }
+    ],
+    "solution": "from collections import Counter\nimport heapq\n\n\ndef top_errors(errors, k):\n    \"\"\"The k most frequent error strings, most frequent first.\"\"\"\n    if k <= 0:\n        return []\n    counts = Counter(errors)\n    # nsmallest with a negated frequency sorts descending by count, and the\n    # tie-break on x makes the output deterministic rather than dependent on\n    # the order errors happened to arrive in.\n    return heapq.nsmallest(k, counts, key=lambda x: (-counts[x], x))\n",
+    "hints": [
+      "Count once, then select by a compound key.",
+      "State the memory cost of exact counts for unbounded distinct errors."
+    ],
+    "followups": [
+      "Stage 2: top errors within the last five minutes.",
+      "Stage 3: approximate heavy hitters under a strict memory limit."
+    ],
+    "complexity": "O(n + u log min(k,u)) time (sorting when k >= u); O(u) space.",
+    "difficulty": "Easy"
+  },
+  {
+    "id": "search",
+    "title": "Boolean document search",
+    "topic": "Maps & sets",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "class SearchIndex:\n    def add(self, doc_id, text):\n        pass\n\n    def search(self, query):\n        pass\n",
+    "statement": "Index documents with integer IDs. Tokens are text.lower().split(); punctuation is kept. Adding an existing ID replaces its content. search returns sorted IDs containing every query token; repeated query terms have no extra effect. Empty query returns [].",
+    "examples": "add(1,\"Red blue\"); add(2,\"blue\"); search(\"RED blue\") → [1]",
+    "tests": [
+      {
+        "name": "Intersection and case",
+        "code": "s=SearchIndex(); s.add(1,\"Red blue\"); s.add(2,\"blue\"); assert s.search(\"RED blue\")==[1]; assert s.search(\"blue blue\")==[1,2]"
+      },
+      {
+        "name": "Replacement",
+        "code": "s=SearchIndex(); s.add(1,\"old\"); s.add(1,\"new\"); assert s.search(\"old\")==[]; assert s.search(\"new\")==[1]"
+      },
+      {
+        "name": "Missing and empty",
+        "code": "s=SearchIndex(); assert s.search(\"\")==[]; assert s.search(\"unknown\")==[]"
+      },
+      {
+        "name": "Replacement removes stale postings",
+        "code": "s=SearchIndex(); s.add(1,\"old old\"); s.add(2,\"old new\"); s.add(1,\"\"); assert s.search(\"old\")==[2]; assert s.search(\"old new\")==[2]"
+      },
+      {
+        "name": "Case, punctuation and duplicate query terms",
+        "code": "s=SearchIndex(); s.add(2,\"Hello, WORLD\"); s.add(1,\"hello world\"); assert s.search(\"WORLD world\")==[1,2]; assert s.search(\"hello,\")==[2]; assert s.search(\" \")==[]"
+      }
+    ],
+    "solution": "from collections import defaultdict\n\n\nclass SearchIndex:\n    \"\"\"An inverted index mapping each term to the documents containing it.\"\"\"\n\n    def __init__(self):\n        # doc id -> the terms it contains, so re-adding can clear the old ones.\n        self.docs = {}\n        # term -> set of doc ids.\n        self.index = defaultdict(set)\n\n    def add(self, doc_id, text):\n        # Removing the previous posting lists first is what makes re-adding a\n        # document replace its content rather than merge into it.\n        for term in self.docs.get(doc_id, set()):\n            self.index[term].discard(doc_id)\n        # lower().split() keeps punctuation, which documents and queries both\n        # still contain.\n        terms = set(text.lower().split())\n        self.docs[doc_id] = terms\n        for term in terms:\n            self.index[term].add(doc_id)\n\n    def search(self, query):\n        terms = set(query.lower().split())\n        if not terms:\n            return []\n        # Every query term must be present, so this is an intersection of\n        # posting lists. Intersecting the smallest first keeps it cheap: the\n        # result can never be larger than the smallest list.\n        postings = sorted((self.index.get(t, set()) for t in terms), key=len)\n        matches = postings[0].copy()\n        for posting in postings[1:]:\n            matches.intersection_update(posting)\n        return sorted(matches)\n",
+    "hints": [
+      "An inverted index maps term to document IDs.",
+      "Replacement must remove the old postings."
+    ],
+    "followups": [
+      "Stage 2: OR, NOT, and phrase queries with token positions.",
+      "Stage 3: shard the index, update asynchronously, and enforce access controls."
+    ],
+    "complexity": "Add O(old + new terms); search proportional to postings intersection plus O(r log r) output sort; O(total indexed terms).",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "weighted",
+    "title": "Lowest-latency network route",
+    "topic": "Graphs",
+    "mode": "Think before coding",
+    "minutes": 40,
+    "starter": "def min_latency(graph, source, target):\n    pass\n",
+    "statement": "graph maps nodes to lists of (neighbor, nonnegative integer latency). Return minimum total latency or -1 if unreachable. Missing nodes have no outgoing edges. source == target returns 0.",
+    "examples": "a→b cost 10; a→c cost 1; c→b cost 2 → a→b costs 3",
+    "tests": [
+      {
+        "name": "Indirect faster",
+        "code": "assert min_latency({\"a\":[(\"b\",10),(\"c\",1)],\"c\":[(\"b\",2)]},\"a\",\"b\")==3"
+      },
+      {
+        "name": "Zero cycle and missing",
+        "code": "assert min_latency({\"a\":[(\"b\",0)],\"b\":[(\"a\",0),(\"c\",2)]},\"a\",\"c\")==2; assert min_latency({},\"a\",\"b\")==-1; assert min_latency({},\"a\",\"a\")==0"
+      },
+      {
+        "name": "Zero weight cycles and duplicate edges",
+        "code": "g={\"a\":[(\"b\",3),(\"b\",0)],\"b\":[(\"a\",0),(\"c\",2)]}; assert min_latency(g,\"a\",\"c\")==2; assert min_latency(g,\"c\",\"a\")==-1"
+      },
+      {
+        "name": "Later cheaper path and identity",
+        "code": "assert min_latency({\"a\":[(\"t\",10),(\"b\",1)],\"b\":[(\"t\",1)]},\"a\",\"t\")==2; assert min_latency({},\"x\",\"x\")==0"
+      }
+    ],
+    "solution": "import heapq\n\n\ndef min_latency(graph, source, target):\n    \"\"\"The cheapest total weight from source to target, or -1 if unreachable.\n\n    Dijkstra, which is breadth-first search with weights: the priority queue\n    always expands the cheapest known route next.\n    \"\"\"\n    distances = {source: 0}\n    heap = [(0, source)]\n    while heap:\n        cost, node = heapq.heappop(heap)\n        # A stale entry, pushed before a better route to this node was found.\n        if cost != distances[node]:\n            continue\n        if node == target:\n            # Nothing left in the heap can be cheaper.\n            return cost\n        for nxt, weight in graph.get(node, []):\n            candidate = cost + weight\n            # Strict improvement only. With zero-weight edges, accepting an\n            # equal cost would let a route relax against itself forever.\n            if candidate < distances.get(nxt, float('inf')):\n                distances[nxt] = candidate\n                heapq.heappush(heap, (candidate, nxt))\n    return -1\n",
+    "hints": [
+      "Use a priority queue ordered by known total latency.",
+      "Discard stale heap entries."
+    ],
+    "followups": [
+      "Stage 2: reconstruct the route; handle multiple source regions.",
+      "Stage 3: explain why negative edges invalidate this algorithm."
+    ],
+    "complexity": "O((V+E) log(V+E)) with a lazy heap; O(V+E) space.",
+    "difficulty": "Medium"
+  },
+  {
+    "id": "rle",
+    "title": "Run-length stream iterator",
+    "topic": "Iterators & OOP",
+    "mode": "Build in stages",
+    "minutes": 30,
+    "starter": "class RLEIterator:\n    def __init__(self, runs):\n        pass\n\n    def next(self, n):\n        pass\n",
+    "statement": "runs is a list of (nonnegative count, integer value). next(n), n>=1, consumes n values and returns the last consumed value; if fewer than n remain, consume the remainder and return -1. Do not expand runs. Values are nonnegative.",
+    "examples": "runs=[(3,8),(0,9),(2,5)]; next(2) → 8; next(2) → 5; next(2) → -1",
+    "tests": [
+      {
+        "name": "Cross boundaries",
+        "code": "r=RLEIterator([(3,8),(0,9),(2,5)]); assert r.next(2)==8; assert r.next(2)==5; assert r.next(2)==-1; assert r.next(1)==-1"
+      },
+      {
+        "name": "Huge counts",
+        "code": "r=RLEIterator([(10**12,7)]); assert r.next(10**12)==7; assert r.next(1)==-1"
+      },
+      {
+        "name": "Empty",
+        "code": "r=RLEIterator([]); assert r.next(1)==-1"
+      },
+      {
+        "name": "Zero runs and exhaustion consumption",
+        "code": "r=RLEIterator([(0,7),(2,0),(0,8),(1,4)]); assert r.next(2)==0; assert r.next(2)==-1; assert r.next(1)==-1"
+      },
+      {
+        "name": "Large runs without expansion",
+        "code": "r=RLEIterator([(10**12,5),(1,9)]); assert r.next(10**12)==5; assert r.next(1)==9; assert r.next(1)==-1"
+      }
+    ],
+    "solution": "class RLEIterator:\n    \"\"\"Iterates a run-length encoded stream without expanding it.\n\n    Work stays proportional to the runs crossed, never to the number of\n    values the runs represent.\n    \"\"\"\n\n    def __init__(self, runs):\n        # Copied, so mutating a run decrements our position rather than the\n        # caller's list.\n        self.runs = [list(r) for r in runs]\n        self.i = 0\n\n    def next(self, n):\n        while self.i < len(self.runs):\n            count, value = self.runs[self.i]\n            if count >= n:\n                # Consumed from the current run; it stays for the next call.\n                self.runs[self.i][0] -= n\n                return value\n            # The request spans past this run, so consume what is left and\n            # continue into the next one.\n            n -= count\n            self.i += 1\n        return -1\n",
+    "hints": [
+      "Keep a run index and remaining count.",
+      "Consume whole runs at once."
+    ],
+    "followups": [
+      "Stage 2: snapshot and restore iterator position.",
+      "Stage 3: compose filters/merges over resumable iterators without materialization."
+    ],
+    "complexity": "O(r) across crossed runs plus O(1) per call; O(r) copied run storage.",
+    "difficulty": "Easy"
+  },
+  {
+    "id": "nodes",
+    "title": "Asynchronous node counting",
+    "topic": "Async & coordination",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "class Node:\n    def __init__(self, node_id):\n        pass\n\n    def merge(self, payload):\n        pass\n\n    def count(self):\n        pass\n\n    def converged(self, truth):\n        pass\n\n\nclass Channel:\n    def __init__(self):\n        pass\n\n    def duplicate_every(self, k):\n        pass\n\n    def drop_every(self, k):\n        pass\n\n    def send(self, sender, recipient, payload):\n        pass\n\n    def deliver_all(self):\n        pass\n\n\ndef neighbours(node_ids, adjacency):\n    pass\n\n\ndef component_sizes(node_ids, adjacency):\n    pass\n\n\ndef run(net, node_ids, adjacency, rounds):\n    pass\n",
+    "statement": "Node(node_id) holds known, mapping a node id to the ids it has advertised, starting {self: {self}}. merge(payload) unions a payload per key, returns how many ids were new, and keeps count() O(1). converged(truth) reports whether count() equals truth[node_id]. Channel.send(sender, recipient, payload) queues a payload; deliver_all() delivers the queue in send order and returns the count; duplicate_every(k) doubles and drop_every(k) discards every k-th send, 0 disabling. component_sizes(node_ids, adjacency) returns each node's true component size. run(net, node_ids, adjacency, rounds) returns {counts, converged, rounds}, stopping when a round teaches nothing new. adjacency is undirected.",
+    "examples": "run(Channel(),[\"a\",\"b\",\"c\"],{\"a\":[\"b\"],\"b\":[\"a\",\"c\"],\"c\":[\"b\"]},5) → {\"a\":3,\"b\":3,\"c\":3} in 3 rounds; run(Channel(),[\"a\",\"b\",\"x\",\"y\"],{\"a\":[\"b\"],\"x\":[\"y\"]},6) → {\"a\":2,\"b\":2,\"x\":2,\"y\":2}",
+    "tests": [
+      {
+        "name": "Two connected nodes converge",
+        "code": "out = run(Channel(), [\"a\", \"b\"], {\"a\": [\"b\"]}, 5)\nassert out[\"counts\"] == {\"a\": 2, \"b\": 2}\nassert out[\"converged\"] is True and out[\"rounds\"] == 2\nsolo = Node(\"a\")\nassert solo.count() == 1 and solo.converged({\"a\": 1})\nassert solo.merge({\"b\": {\"b\"}}) == 1 and solo.count() == 2"
+      },
+      {
+        "name": "Branching topology inside the round budget",
+        "code": "ids = [\"s\", \"a\", \"b\", \"c\", \"t\"]\nadj = {\"s\": [\"a\", \"b\"], \"a\": [\"c\"], \"b\": [\"c\"], \"c\": [\"t\"]}\nbudget = 4\nout = run(Channel(), ids, adj, budget)\nassert out[\"counts\"] == {n: 5 for n in ids} and out[\"converged\"]\nassert out[\"rounds\"] == 4 and out[\"rounds\"] <= budget\nassert run(Channel(), ids, adj, 3)[\"converged\"] is True\nstarved = run(Channel(), ids, adj, 2)\nassert starved[\"converged\"] is False and starved[\"rounds\"] == 2\nassert component_sizes(ids, adj) == {n: 5 for n in ids}"
+      },
+      {
+        "name": "Components size themselves and nobody reports the total",
+        "code": "ids = [\"a\", \"b\", \"x\", \"y\"]\nadj = {\"a\": [\"b\"], \"x\": [\"y\"]}\nout = run(Channel(), ids, adj, 6)\nassert out[\"counts\"] == {\"a\": 2, \"b\": 2, \"x\": 2, \"y\": 2}\nassert out[\"converged\"] and out[\"rounds\"] == 2\nassert 4 not in out[\"counts\"].values()\nstray = run(Channel(), [\"a\", \"b\"], {\"a\": [\"b\", \"ghost\"], \"b\": [\"a\"], \"z\": [\"a\"]}, 5)\nassert stray[\"counts\"] == {\"a\": 2, \"b\": 2}"
+      },
+      {
+        "name": "Duplicates and snapshots keep the count honest",
+        "code": "ids = [\"a\", \"b\", \"c\"]\nadj = {\"a\": [\"b\"], \"b\": [\"a\", \"c\"], \"c\": [\"b\"]}\ntwice = Channel().duplicate_every(1)\nout = run(twice, ids, adj, 5)\nassert out[\"counts\"] == {\"a\": 3, \"b\": 3, \"c\": 3} and out[\"converged\"]\nassert out[\"rounds\"] == 3 and twice.delivered == 2 * twice.sent\nodd = run(Channel().duplicate_every(2), ids, adj, 5)\nassert odd[\"counts\"] == out[\"counts\"]\nnode = Node(\"x\")\nassert node.merge({\"y\": {\"y\"}, \"z\": {\"y\", \"z\"}}) == 2\nassert node.count() == 3 and node.converged({\"x\": 3})\nnet = Channel()\na, b, c = Node(\"a\"), Node(\"b\"), Node(\"c\")\nnet.send(a, b, a.known)\na.merge({c.node_id: {c.node_id}})\nassert net.deliver_all() == 1\nassert b.count() == 2 and a.count() == 2"
+      },
+      {
+        "name": "Lone node, clique and an empty round budget",
+        "code": "solo = run(Channel(), [\"solo\"], {}, 4)\nassert solo[\"counts\"] == {\"solo\": 1} and solo[\"converged\"]\nassert solo[\"rounds\"] == 1\nids = [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\"]\nclique = {a: [b for b in ids if b != a] for a in ids}\nwide = run(Channel(), ids, clique, 3)\nassert wide[\"counts\"] == {a: 6 for a in ids} and wide[\"converged\"]\nassert wide[\"rounds\"] == 2\nzero = run(Channel(), [\"a\", \"b\"], {\"a\": [\"b\"], \"b\": [\"a\"]}, 0)\nassert zero[\"counts\"] == {\"a\": 1, \"b\": 1}\nassert zero[\"converged\"] is False and zero[\"rounds\"] == 0\nlossy = Channel().drop_every(2)\nout = run(lossy, [\"a\", \"b\"], {\"a\": [\"b\"], \"b\": [\"a\"]}, 5)\nassert out[\"converged\"] is False and out[\"counts\"][\"a\"] == 1\nassert lossy.sent == 4 and lossy.delivered == 2"
+      }
+    ],
+    "solution": "class Node:\n    \"\"\"One cluster member: a membership vector plus the count it derives.\n\n    The vector is keyed by origin so a merge is a union per key, which keeps\n    the thing a node gossips stable in shape as the cluster grows.\n    \"\"\"\n\n    def __init__(self, node_id):\n        self.node_id = node_id\n        # Membership vector: node id -> the ids that node has advertised here.\n        self.known = {node_id: {node_id}}\n        # The union of every set in `known`, held alongside it. Merging adds\n        # only the genuinely new ids, so count() never walks the vector.\n        self.seen = {node_id}\n        # Monotone count of ids ever learned, so the driver can ask whether a\n        # round moved anything without diffing a single vector.\n        self.gained = 0\n\n    def merge(self, payload):\n        \"\"\"Union a neighbour's membership vector in; return ids newly learned.\"\"\"\n        learned = 0\n        for origin, peers in payload.items():\n            self.known.setdefault(origin, set()).update(peers)\n            # Subtracted from the union, not from this origin's set: an id two\n            # neighbours both advertise is still one node, not two.\n            fresh = peers - self.seen\n            if fresh:\n                self.seen |= fresh\n                learned += len(fresh)\n        self.gained += learned\n        return learned\n\n    def count(self):\n        # O(1). A count that re-walked `known` would be O(V) per call, and\n        # asking every node for one per round turns the loop quadratic for no\n        # reason: the merge already knows how much arrived.\n        return len(self.seen)\n\n    def converged(self, truth):\n        # Measured against ground truth the harness owns. A node cannot tell it\n        # is converged by looking at its own set -- it can only be wrong about\n        # the size of a component it is not in.\n        return self.count() == truth.get(self.node_id)\n\n\nclass Channel:\n    \"\"\"An unordered link that may duplicate a message or lose it entirely.\"\"\"\n\n    def __init__(self):\n        self.queue = []\n        self.sent = 0\n        self.delivered = 0\n        self.drop_period = 0\n        self.duplicate_period = 0\n\n    def duplicate_every(self, k):\n        \"\"\"Queue every k-th send twice. 0 disables duplication.\"\"\"\n        self.duplicate_period = k\n        return self\n\n    def drop_every(self, k):\n        \"\"\"Discard every k-th send. 0 disables loss.\"\"\"\n        self.drop_period = k\n        return self\n\n    def send(self, sender, recipient, payload):\n        \"\"\"Queue one message. Returns False when the link swallowed it.\"\"\"\n        index = self.sent\n        self.sent += 1\n        if self.drop_period and (index + 1) % self.drop_period == 0:\n            return False\n        # A snapshot, not a live reference: the sender goes on merging after the\n        # send, and a shared set would let a claim mutate in the queue, so the\n        # channel would deliver something no node ever said.\n        message = {origin: set(peers) for origin, peers in payload.items()}\n        self.queue.append((sender, recipient, message))\n        if self.duplicate_period and (index + 1) % self.duplicate_period == 0:\n            self.queue.append((sender, recipient, message))\n        return True\n\n    def deliver_all(self):\n        \"\"\"Deliver everything queued, in send order. Returns the message count.\"\"\"\n        pending, self.queue = self.queue, []\n        for _sender, recipient, message in pending:\n            recipient.merge(message)\n        self.delivered += len(pending)\n        return len(pending)\n\n\ndef neighbours(node_ids, adjacency):\n    \"\"\"Undirected neighbours per node; ids outside the cluster are ignored.\"\"\"\n    live = set(node_ids)\n    links = {node_id: set() for node_id in node_ids}\n    for node_id, adjacent in adjacency.items():\n        if node_id not in live:\n            continue\n        for other in adjacent:\n            if other in live:\n                # The wire works both ways, so one entry in either direction\n                # gives both nodes a link.\n                links[node_id].add(other)\n                links[other].add(node_id)\n    return links\n\n\ndef component_sizes(node_ids, adjacency):\n    \"\"\"Ground truth: the true size of the component each node belongs to.\"\"\"\n    links = neighbours(node_ids, adjacency)\n    sizes = {}\n    for start in node_ids:\n        if start in sizes:\n            continue\n        seen = {start}\n        stack = [start]\n        while stack:\n            for other in links[stack.pop()]:\n                if other not in seen:\n                    seen.add(other)\n                    stack.append(other)\n        for node_id in seen:\n            sizes[node_id] = len(seen)\n    return sizes\n\n\ndef run(net, node_ids, adjacency, rounds):\n    \"\"\"Drive the protocol for at most `rounds` rounds of gossip.\n\n    Returns {\"counts\": ..., \"converged\": ..., \"rounds\": ...}. Convergence is\n    measured against component_sizes rather than inferred from the loop\n    stopping, because stopping early is not the same as being right.\n    \"\"\"\n    nodes = {node_id: Node(node_id) for node_id in node_ids}\n    truth = component_sizes(node_ids, adjacency)\n    wired = neighbours(node_ids, adjacency)\n    # Sorted so the loss and duplication patterns hit the same sends every run.\n    links = sorted((a, b) for a in node_ids for b in wired[a])\n    used = 0\n    for _ in range(rounds):\n        used += 1\n        before = sum(node.gained for node in nodes.values())\n        for source, target in links:\n            net.send(nodes[source], nodes[target], nodes[source].known)\n        net.deliver_all()\n        # A node only ever grows, so comparing the monotone totals says\n        # whether the round moved anything without diffing any vector.\n        if sum(node.gained for node in nodes.values()) == before:\n            break\n    counts = {node_id: nodes[node_id].count() for node_id in node_ids}\n    converged = all(nodes[node_id].converged(truth) for node_id in node_ids)\n    return {\"counts\": counts, \"converged\": converged, \"rounds\": used}\n",
+    "hints": [
+      "A node's answer comes from the union it holds, never from the cluster size.",
+      "Grow by union only, so a duplicated message costs nothing."
+    ],
+    "followups": [
+      "Stage 2: replace full-set gossip with a phase-numbered protocol that forwards only the ids learned in the previous phase.",
+      "Stage 3: derive the bytes-per-round cost of a membership vector at cluster scale, and say the figure at which it stops being affordable.",
+      "How would you tell a split brain partition apart from a slow network in production?"
+    ],
+    "complexity": "merge is linear in the payload, count and converged are O(1) because the count is maintained rather than recomputed over known. One round sends the whole membership vector over every link, so a round costs O(links x V) set work, and a component of diameter d settles in at most d + 1 rounds: the extra round only observes that nothing changed.",
+    "difficulty": "Hard"
+  },
+  {
+    "id": "resumable",
+    "title": "Resumable record iterator",
+    "topic": "Iterators & OOP",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "def _factory(source):\n    pass\n\n\nclass _Cursor:\n    def __init__(self, source, stages=()):\n        pass\n\n    def __iter__(self):\n        pass\n\n    def __next__(self):\n        pass\n\n    def restore(self, pos):\n        pass\n\n\nclass Resumable:\n    def __init__(self, source, stages=()):\n        pass\n\n    def snapshot(self):\n        pass\n\n    def restore(self, pos):\n        pass\n\n    def next(self, n):\n        pass\n\n\ndef _raw(source):\n    pass\n\n\ndef chain(a, b):\n    pass\n\n\ndef filtered(pred, source):\n    pass\n\n\ndef taken(n, source):\n    pass\n\n\nclass JsonObjects:\n    def __init__(self, chunks):\n        pass\n\n    def __iter__(self):\n        pass\n",
+    "statement": "source is a zero-argument callable returning a fresh iterator, or a container that can be iterated more than once. Resumable(source).next(n), n>=1, pulls n items and returns the last, or -1 when fewer than n remain. snapshot() is an int: source items taken. restore(pos) runs the source again, discarding items until pos have been taken; a position past the end leaves the stream exhausted. Nothing is materialised. chain(a,b), filtered(pred,source) and taken(n,source) each return a new Resumable over the underlying source, and report their source's position. JsonObjects(chunks) is a re-iterable source of the JSON objects in a str or bytes stream; objects straddle chunk boundaries.",
+    "examples": "r=Resumable(range(1,6)); r.next(2) → 2; pos=r.snapshot() → 2; r.next(2) → 4; r.restore(pos); r.next(2) → 4; r.next(1) → 5; r.next(1) → -1",
+    "tests": [
+      {
+        "name": "Source is never drained up front",
+        "code": "made = [0]\ndef source():\n    for i in range(1000):\n        made[0] += 1\n        yield i\nr = Resumable(source)\nassert made[0] == 0\nassert r.snapshot() == 0\nassert r.next(3) == 2\nassert made[0] == 3\nr.restore(1)\nassert made[0] == 4\nassert r.snapshot() == 1\nassert r.next(2) == 2"
+      },
+      {
+        "name": "Snapshot and restore replay the stream",
+        "code": "r = Resumable(lambda: iter([1, 2, 3, 4, 5]))\nassert r.snapshot() == 0\nassert r.next(2) == 2\npos = r.snapshot()\nassert pos == 2\nassert r.next(2) == 4\nassert r.next(1) == 5\nassert r.next(1) == -1\nassert r.snapshot() == 5\nr.restore(pos)\nassert r.next(2) == 4\nassert r.next(1) == 5\nassert r.next(1) == -1\nr.restore(5)\nassert r.next(1) == -1\nr.restore(0)\nassert r.next(1) == 1"
+      },
+      {
+        "name": "Filter, chain and take share the source position",
+        "code": "base = Resumable(lambda: iter(range(1, 11)))\nevens = filtered(lambda v: v % 2 == 0, base)\nassert evens.next(1) == 2\nassert evens.snapshot() == 2\nassert evens.next(2) == 6\nassert evens.snapshot() == 6\ntoken = evens.snapshot()\nassert evens.next(1) == 8\nevens.restore(token)\nassert evens.next(1) == 8\nassert evens.next(2) == -1\nassert evens.next(1) == -1\nevens.restore(0)\nassert evens.next(1) == 2\nassert base.snapshot() == 0\nassert base.next(1) == 1\njoined = chain(base, base)\nassert joined.snapshot() == 0\nassert joined.next(10) == 10\nassert joined.next(10) == 10\nassert joined.snapshot() == 20\nassert joined.next(1) == -1\njoined.restore(0)\nassert joined.next(1) == 1\nhead = taken(2, lambda: iter([9, 8, 7, 6]))\nassert head.next(2) == 8\nassert head.next(1) == -1\nassert head.snapshot() == 2"
+      },
+      {
+        "name": "JSON objects split across chunk boundaries",
+        "code": "want = [\n    {\"id\": 1, \"note\": \"a}b{c\"},\n    {\"id\": 2, \"nested\": {\"n\": [1, 2]}},\n    {\"id\": 3, \"q\": 'say \"hi\"'},\n]\ntext = \" \".join(json.dumps(obj) for obj in want)\nassert '\"q\": \"say \\\\\"hi\\\\\"\"' in text\nchunks = [text[i:i + 3] for i in range(0, len(text), 3)]\nassert list(JsonObjects(chunks)) == want\nassert list(JsonObjects([text])) == want\nassert list(JsonObjects([text.encode(\"utf-8\")])) == want\nr = Resumable(JsonObjects(chunks))\nassert r.next(2) == want[1]\npos = r.snapshot()\nassert r.next(1) == want[2]\nr.restore(pos)\nassert r.next(1) == want[2]\nassert r.next(1) == -1"
+      },
+      {
+        "name": "Empty, exhausted and oversized requests",
+        "code": "empty = Resumable(lambda: iter([]))\nassert empty.snapshot() == 0\nassert empty.next(1) == -1\nassert empty.next(10 ** 9) == -1\nassert empty.snapshot() == 0\nempty.restore(0)\nassert empty.next(1) == -1\nquiet = Resumable(lambda: (item for item in ()))\nassert quiet.next(1) == -1\nassert filtered(lambda v: True, quiet).next(1) == -1\nassert taken(0, lambda: iter([1, 2])).next(1) == -1\nbig = Resumable(lambda: iter(range(100000)))\nassert big.next(100000) == 99999\nassert big.snapshot() == 100000\nassert big.next(1) == -1\nbig.restore(99999)\nassert big.next(1) == 99999\nassert big.next(1) == -1"
+      }
+    ],
+    "solution": "import json\n\n\ndef _factory(source):\n    # A callable can be run again, so it is the natural source. Anything else\n    # has to be iterable more than once, which is exactly why a bare\n    # generator is not usable here: it cannot be replayed.\n    if callable(source):\n        return source\n    return lambda: iter(source)\n\n\ndef _raw(source):\n    # A Resumable handed in as a source contributes its raw source, so a\n    # derived stream replays the pipeline from the start and leaves the\n    # original's own position where it was.\n    if isinstance(source, Resumable):\n        return source.source\n    return _factory(source)\n\n\nclass _Cursor:\n    \"\"\"The bottom of a pipeline: the source iterator and the count taken.\n\n    This is where a position comes from and where laziness is enforced. Every\n    stage sits above the cursor, so the count is items taken from the source\n    rather than items handed out, which is what keeps a filtered stream's\n    position comparable with the position of the stream underneath it.\n    \"\"\"\n\n    def __init__(self, source, stages=()):\n        self._open = _factory(source)\n        self._stages = tuple(stages)\n        self.pos = 0\n        self._items = self._rebuild()\n\n    def _rebuild(self):\n        stream = self._open()\n        # Counted before the stages, so an item the stages go on to reject\n        # still moves the position. That is what makes a filtered stream's\n        # snapshot mean the same thing as the snapshot of its source.\n        stream = self._counted(stream)\n        for stage in self._stages:\n            stream = stage(stream)\n        return iter(stream)\n\n    def _counted(self, stream):\n        for item in stream:\n            self.pos += 1\n            yield item\n\n    def __iter__(self):\n        return self\n\n    def __next__(self):\n        return next(self._items)\n\n    def restore(self, pos):\n        # The hard part. A generator cannot be rewound, so the only way back is\n        # to run the source again and throw the output away. Rebuilding the\n        # stages as well as the source is what re-applies a filter.\n        self.pos = 0\n        self._items = self._rebuild()\n        while self.pos < pos:\n            try:\n                next(self._items)\n            except StopIteration:\n                # The source is shorter than the position. Restoring past the\n                # end leaves the stream exhausted, which is not an error.\n                break\n\n\nclass Resumable:\n    \"\"\"A cursor over a stream of raw items that can be put back.\n\n    The source is never materialised. It is either a zero-argument callable\n    returning a fresh iterator, or a container that can be walked more than\n    once, and every next() pulls exactly the items it needs and no more.\n    \"\"\"\n\n    def __init__(self, source, stages=()):\n        self.source = _raw(source)\n        self._cursor = _Cursor(self.source, stages)\n\n    def snapshot(self):\n        return self._cursor.pos\n\n    def restore(self, pos):\n        self._cursor.restore(pos)\n\n    def next(self, n):\n        last = None\n        for _ in range(n):\n            try:\n                last = next(self._cursor)\n            except StopIteration:\n                # Everything that was left has been consumed, and the answer is\n                # -1 because there were not n items to give.\n                return -1\n        return last\n\n\ndef _joined(first, second):\n    for source in (first, second):\n        for item in source():\n            yield item\n\n\ndef chain(a, b):\n    \"\"\"a's items, then b's items, as one stream.\n\n    The position is a count into the concatenation, so restoring walks a and\n    then b until it has passed it.\n    \"\"\"\n    first, second = _raw(a), _raw(b)\n    return Resumable(lambda: _joined(first, second))\n\n\ndef _only(pred):\n    def stage(stream):\n        return (item for item in stream if pred(item))\n\n    return stage\n\n\ndef filtered(pred, source):\n    # The predicate is part of what the position means, so it lives in the\n    # pipeline and is rebuilt on restore rather than being dropped.\n    return Resumable(source, (_only(pred),))\n\n\ndef _limited(stream, n):\n    count = 0\n    while count < n:\n        count += 1\n        yield next(stream)\n\n\ndef _head(n):\n    def stage(stream):\n        return _limited(stream, n)\n\n    return stage\n\n\ndef taken(n, source):\n    # Stopping after exactly n pulls keeps the position at n: the stage never\n    # reaches for one more item to discover that the stream has ended.\n    return Resumable(source, (_head(n),))\n\n\nclass JsonObjects:\n    \"\"\"A re-iterable stream of the JSON objects hidden in a chunked text.\n\n    The scan keeps its place across chunk boundaries, so an object split\n    anywhere, even one character at a time, is delivered once and whole.\n    \"\"\"\n\n    def __init__(self, chunks):\n        self.chunks = chunks\n\n    def __iter__(self):\n        buffer = ''\n        scan = 0\n        depth = 0\n        in_string = False\n        escaped = False\n        for chunk in self.chunks:\n            if isinstance(chunk, bytes):\n                chunk = chunk.decode('utf-8')\n            buffer += chunk\n            while scan < len(buffer):\n                ch = buffer[scan]\n                if in_string:\n                    # Inside a string only the escape rules apply: a brace is\n                    # data and an escaped quote does not close anything.\n                    if escaped:\n                        escaped = False\n                    elif ch == '\\\\':\n                        escaped = True\n                    elif ch == '\"':\n                        in_string = False\n                elif ch == '\"':\n                    in_string = True\n                elif ch == '{':\n                    depth += 1\n                elif ch == '}':\n                    depth -= 1\n                    if depth == 0:\n                        text = buffer[:scan + 1]\n                        buffer = buffer[scan + 1:]\n                        scan = 0\n                        yield json.loads(text)\n                        continue\n                scan += 1\n            if depth == 0:\n                # Nothing is open, so whatever the scan has passed is\n                # whitespace between objects and can be dropped.\n                buffer = buffer[scan:]\n                scan = 0\n",
+    "hints": [
+      "A position is a count of source items taken and nothing else.",
+      "restore replays the source, so it costs time proportional to the position."
+    ],
+    "followups": [
+      "Stage 2: keep a bounded window of consumed items so restore does not re-run the source, and spill the rest.",
+      "Stage 3: replay an append-only log from a checkpoint across reordered segments, and prove the replayed stream matches the original.",
+      "A long job is killed mid-stream and restarted. What do you persist, and what do you lose?"
+    ],
+    "complexity": "O(items pulled) per next, O(1) snapshot, O(pos) time and no buffering per restore. Peak memory is O(1) beyond whatever the source itself holds, so a chain of combinators multiplies cost, not memory.",
+    "difficulty": "Hard"
+  },
+  {
+    "id": "persist",
+    "title": "Durable key-value records",
+    "topic": "State & time",
+    "mode": "Think before coding",
+    "minutes": 60,
+    "starter": "CURRENT_VERSION = 2\nMIGRATIONS = {}\n\n\nclass RecordCodec:\n    def __init__(self, version=None):\n        pass\n\n    def encode(self, state):\n        pass\n\n    def decode(self, text):\n        pass\n\n\nclass Journal:\n    def __init__(self, codec=None):\n        pass\n\n    def append(self, key, value, now):\n        pass\n\n    def remove(self, key, now):\n        pass\n\n    def append_raw(self, text):\n        pass\n\n    def load(self, now):\n        pass\n\n    def snapshot(self, now):\n        pass\n\n    def restore(self, snapshot, now):\n        pass\n",
+    "statement": "RecordCodec.encode(state) writes a state dict as one versioned line; decode(text) reads it back, upgrading older versions. Journal(codec=None) keeps an append-only log in self.log, a list of raw lines; append(key, value, now) and remove(key, now) each write one line, append_raw(text) writes text as given. load(now) replays the log, the last write winning and a tombstone deleting, ignoring anything stamped later than now. A final line with no newline is a torn write, dropped; any other line that does not decode raises ValueError. snapshot(now) returns {at, now, data}; restore(snapshot, now) replays only the entries after it and raises ValueError when now precedes snapshot['now'].",
+    "examples": "state={'b':0,'a':None}; encode(state) → v2 {\"a\": null, \"b\": 0}; decode(encode(state)) → {'a':None,'b':0}; j.append('a',1,0); j.append('a',2,1); j.remove('a',2) → load(9) == {}",
+    "tests": [
+      {
+        "name": "Round trip keeps empty and null distinct",
+        "code": "c = RecordCodec()\nassert c.encode({}) == 'v2 {}'\nassert c.decode('v2 {}') == {}\nstate = {\"none\": None, \"empty\": \"\", \"zero\": 0, \"off\": False, \"blank\": [], \"void\": {}}\nassert c.decode(c.encode(state)) == state\nassert c.decode(c.encode({\"none\": None})) != {}\nassert \"none\" in c.decode(c.encode({\"none\": None}))\nassert c.encode({\"a\": 1, \"b\": 2}) == c.encode({\"b\": 2, \"a\": 1})\nassert c.encode({\"a\": 1, \"b\": 2}) == 'v2 {\"a\": 1, \"b\": 2}'"
+      },
+      {
+        "name": "Last write wins and tombstones delete",
+        "code": "j = Journal()\nassert j.load(10) == {}\nj.append(\"a\", 1, 0)\nj.append(\"b\", 2, 0)\nj.append(\"a\", 3, 1)\nassert j.load(10) == {\"a\": 3, \"b\": 2}\nj.remove(\"a\", 2)\nassert j.load(10) == {\"b\": 2}\nj.append(\"b\", 0, 3)\nassert j.load(10) == {\"b\": 0}\nj.append(\"c\", None, 4)\nassert j.load(10) == {\"b\": 0, \"c\": None}\nassert j.load(3) == {\"b\": 0}"
+      },
+      {
+        "name": "Torn tail dropped, corrupt middle rejected",
+        "code": "j = Journal()\nj.append(\"a\", 1, 0)\nj.append_raw('v2 {\"key\": \"b\", \"value\": 2, \"deleted\": false, \"at\": 1}\\n')\nj.append_raw('v2 {\"key\": \"c\", \"value\": 3, \"de')\nassert j.load(10) == {\"a\": 1, \"b\": 2}\nwhole = Journal()\nwhole.append(\"a\", 1, 0)\nwhole.append(\"b\", 2, 1)\nwhole.append(\"d\", 4, 2)\nassert whole.load(10) == {\"a\": 1, \"b\": 2, \"d\": 4}\nglued = Journal()\nglued.append(\"a\", 1, 0)\nglued.append_raw('v2 {\"key\": \"c\", \"value\": 3, \"de')\nglued.append_raw('v2 {\"key\": \"d\", \"value\": 4, \"deleted\": false, \"at\": 2}\\n')\ntry:\n    glued.load(10)\n    assert False\nexcept ValueError:\n    pass\nbad = Journal()\nbad.append(\"a\", 1, 0)\nbad.append_raw('v2 {\"key\": \"b\", \"value\": 2, \"deleted\": false, \"at\": 1}\\n')\nbad.append_raw('not a record at all\\n')\nbad.append_raw('v2 {\"key\": \"d\", \"value\": 4, \"deleted\": false, \"at\": 2}\\n')\ntry:\n    bad.load(10)\n    assert False\nexcept ValueError:\n    pass\ngap = Journal()\ngap.append_raw('\\n')\ntry:\n    gap.load(10)\n    assert False\nexcept ValueError:\n    pass"
+      },
+      {
+        "name": "Older versions migrate on read",
+        "code": "c = RecordCodec()\nassert c.decode('v1 {\"data\": {\"b\": 2}}') == {\"b\": 2}\nassert c.decode('v1 {\"data\": {}}') == {}\nassert c.decode('v1 {\"data\": {\"a\": null, \"b\": \"\"}}') == {\"a\": None, \"b\": \"\"}\nassert c.decode(c.encode({\"b\": 2})) == {\"b\": 2}\ntry:\n    c.decode('v3 {}')\n    assert False\nexcept ValueError:\n    pass\ntry:\n    c.decode('{}')\n    assert False\nexcept ValueError:\n    pass\nold = Journal()\nold.append_raw('v1 {\"data\": {\"key\": \"a\", \"value\": 1, \"deleted\": false, \"at\": 0}}\\n')\nassert old.load(5) == {\"a\": 1}\nold.append(\"a\", 2, 1)\nassert old.load(5) == {\"a\": 2}\nassert old.codec.encode({\"a\": 2}) == 'v2 {\"a\": 2}'"
+      },
+      {
+        "name": "Snapshot then replay what came after it",
+        "code": "j = Journal()\nj.append(\"a\", 1, 0)\nj.append(\"b\", 2, 1)\nsnap = j.snapshot(1)\nassert snap[\"at\"] == 2\nassert snap[\"now\"] == 1\nassert j.restore(snap, 10) == {\"a\": 1, \"b\": 2}\nj.append(\"c\", 3, 2)\nj.append(\"a\", 9, 3)\nj.remove(\"b\", 4)\nassert j.load(10) == {\"a\": 9, \"c\": 3}\nassert j.restore(snap, 10) == {\"a\": 9, \"c\": 3}\nassert len(j.log) == 5\nlater = j.snapshot(10)\nassert later[\"at\"] == 5\nassert j.restore(later, 10) == {\"a\": 9, \"c\": 3}\nassert j.restore(snap, 3) == {\"a\": 9, \"b\": 2, \"c\": 3}\nassert j.restore(snap, 3) == j.load(3)\nassert j.restore(snap, 2) == {\"a\": 1, \"b\": 2, \"c\": 3}\ntry:\n    j.restore(later, 4)\n    assert False\nexcept ValueError:\n    pass"
+      }
+    ],
+    "solution": "import json\n\nCURRENT_VERSION = 2\n\n\ndef _from_v1(payload):\n    # v1 nested the state under \"data\"; v2 lifted it to the top level.\n    if 'data' not in payload:\n        raise ValueError('v1 payload has no data')\n    return payload['data']\n\n\n# Each entry upgrades a payload by exactly one version, so a future change\n# adds one step instead of rewriting every reader.\nMIGRATIONS = {1: _from_v1}\n\n\nclass RecordCodec:\n    \"\"\"Reads and writes the record format.\n\n    encode is the only writer of this format and decode the only reader, so\n    the two cannot drift. The version is in the text, which is what lets a log\n    written last year be read today.\n    \"\"\"\n\n    CURRENT = CURRENT_VERSION\n\n    def __init__(self, version=None):\n        self.version = self.CURRENT if version is None else version\n\n    def encode(self, state):\n        # Sorted keys make the text canonical: two equal states encode to the\n        # same bytes, which is what a checksum or a diff can rely on.\n        return 'v%d %s' % (self.version, json.dumps(state, sort_keys=True))\n\n    def decode(self, text):\n        header, space, payload = text.partition(' ')\n        if not space or not header.startswith('v'):\n            raise ValueError('missing version header')\n        try:\n            version = int(header[1:])\n        except ValueError:\n            raise ValueError('unreadable version')\n        if version > self.version:\n            # A record from the future is refused rather than misread: data\n            # this reader cannot understand must never look like valid data.\n            raise ValueError('unsupported version')\n        data = json.loads(payload)\n        while version < self.version:\n            if version not in MIGRATIONS:\n                raise ValueError('no migration from version %d' % version)\n            data = MIGRATIONS[version](data)\n            version += 1\n        return data\n\n\nclass Journal:\n    \"\"\"An append-only log of records, replayed to rebuild the state.\"\"\"\n\n    def __init__(self, codec=None):\n        self.codec = RecordCodec() if codec is None else codec\n        # Raw lines exactly as a writer left them, newline included or not.\n        self.log = []\n\n    def _write(self, record):\n        self.log.append(self.codec.encode(record) + '\\n')\n\n    def append(self, key, value, now):\n        self._write({'key': key, 'value': value, 'deleted': False, 'at': now})\n\n    def remove(self, key, now):\n        # A tombstone is a record, not an absence. Without one the key would\n        # come back the next time the log was replayed from an older prefix.\n        self._write({'key': key, 'value': None, 'deleted': True, 'at': now})\n\n    def append_raw(self, text):\n        self.log.append(text)\n\n    def _entries(self):\n        lines = ''.join(self.log).split('\\n')\n        lines.pop()\n        # A crash can only tear the last write, so whatever follows the final\n        # newline is a record that never finished and is dropped. Every other\n        # line is complete and must decode, or the log itself is corrupt.\n        for line in lines:\n            yield self.codec.decode(line)\n\n    def _apply(self, state, record):\n        if record['deleted']:\n            state.pop(record['key'], None)\n        else:\n            state[record['key']] = record['value']\n\n    def load(self, now):\n        state = {}\n        for record in self._entries():\n            if record['at'] > now:\n                # Stamped for a time we have not reached yet.\n                continue\n            self._apply(state, record)\n        return state\n\n    def snapshot(self, now):\n        state = {}\n        at = 0\n        for record in self._entries():\n            if record['at'] > now:\n                continue\n            at += 1\n            self._apply(state, record)\n        # at counts the records folded in. Stamps are nondecreasing, so those\n        # records are a prefix of the log and the count is a usable position.\n        return {'at': at, 'now': now, 'data': self.codec.encode(state)}\n\n    def restore(self, snapshot, now):\n        if now < snapshot['now']:\n            raise ValueError('cannot restore to a time before the snapshot')\n        state = self.codec.decode(snapshot['data'])\n        seen = 0\n        for record in self._entries():\n            if seen < snapshot['at']:\n                # The snapshot is believed rather than checked, and the log is\n                # left alone: restore is positional and does not compact.\n                seen += 1\n                continue\n            if record['at'] > now:\n                continue\n            self._apply(state, record)\n        return state\n",
+    "hints": [
+      "One encoder and one decoder, so the format cannot drift apart.",
+      "A torn write can only be the last line; anything earlier must decode."
+    ],
+    "followups": [
+      "Stage 2: frame every log line with a checksum so a complete but corrupt line is detected.",
+      "Stage 3: compact the log so it stops growing, and say what compaction costs a reader still holding an older snapshot.",
+      "Where do the fsync boundaries go, and what does this in-memory model actually guarantee?"
+    ],
+    "complexity": "O(size of state) per encode and decode, O(records) per load, restore and snapshot because each replays the log, and O(total bytes written) space. Compaction is what turns the log into O(state) again.",
+    "difficulty": "Hard"
+  },
+  {
+    "id": "sheet",
+    "title": "Spreadsheet formula engine",
+    "topic": "Stacks & parsing",
+    "mode": "Build in stages",
+    "minutes": 60,
+    "starter": "class Sheet:\n    def __init__(self):\n        pass\n\n    def get(self, cell):\n        pass\n\n    def set(self, cell, value):\n        pass\n\n    def evaluate(self, formula):\n        pass\n",
+    "statement": "Cells are letters then digits, so AA10 works and rows start at 1. set takes a number or a \"=\" formula over refs, literals, + - * /, parentheses, unary minus and SUM/MIN/MAX/AVG/COUNT on A1:B4. An unset cell reads as 0. Division by zero, and anything reading an error, holds \"error\". evaluate(formula) runs one ad-hoc formula against current values and stores nothing. A reversed range, a bad cell name, an unknown function or a malformed formula raises ValueError and changes nothing.",
+    "examples": "set A1=2, A2=3, B1=\"=(A1+A2)*10\" → 50; set B1=\"=B1+1\" → 51; set C1=\"=1/0\" → \"error\"; evaluate(\"=COUNT(A1:A9)\") → 9",
+    "tests": [
+      {
+        "name": "Precedence, nesting and multi-letter columns",
+        "code": "s=Sheet(); assert s.get(\"A1\")==0\ns.set(\"A1\",2); s.set(\"A2\",3); s.set(\"AA10\",7)\ns.set(\"B1\",\"=(A1+A2)*10\"); s.set(\"C1\",\"=-A1+4\"); s.set(\"D1\",\"=2+3*4\"); s.set(\"E1\",\"=A1/4\")\nassert s.get(\"B1\")==50; assert s.get(\"C1\")==2; assert s.get(\"D1\")==14; assert s.get(\"E1\")==0.5\ns.set(\"AB10\",\"=AA10*A1\"); assert s.get(\"AB10\")==14\nassert s.evaluate(\"=(A1+A2)*AA10\")==35; assert s.evaluate(\"=(2+3)*4\")==20\nassert s.evaluate(\"= -A1 + 1\")==-1\ntry: s.evaluate(\"2+3\")\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")"
+      },
+      {
+        "name": "Functions over ranges and multi-letter columns",
+        "code": "s=Sheet(); assert s.get(\"C1\")==0\ns.set(\"A1\",1); s.set(\"A2\",2); s.set(\"B1\",3); s.set(\"B2\",4); s.set(\"AA1\",10); s.set(\"AB1\",20)\ns.set(\"C1\",\"=SUM(A1:B2)\"); s.set(\"C2\",\"=MIN(A1:B2)\"); s.set(\"C3\",\"=MAX(A1:B2)\")\ns.set(\"C4\",\"=AVG(A1:B2)\"); s.set(\"C5\",\"=COUNT(A1:B2)\"); s.set(\"C6\",\"=SUM(AA1:AB1)\")\nassert s.get(\"C1\")==10; assert s.get(\"C2\")==1; assert s.get(\"C3\")==4\nassert s.get(\"C4\")==2.5; assert s.get(\"C5\")==4; assert s.get(\"C6\")==30\ns.set(\"C7\",\"=SUM(A1:B2,AA1:AB1)\"); assert s.get(\"C7\")==40\ns.set(\"C8\",\"=COUNT(AA1:AC2)\"); assert s.get(\"C8\")==6\ns.set(\"C9\",\"=SUM(A1:A2, A2)\"); assert s.get(\"C9\")==5"
+      },
+      {
+        "name": "An error poisons everything that reads it",
+        "code": "s=Sheet(); s.set(\"A1\",1); s.set(\"B1\",\"=A1/0\")\nassert s.get(\"B1\")==\"error\"\ns.set(\"C1\",\"=B1+1\"); assert s.get(\"C1\")==\"error\"\ns.set(\"D1\",\"=SUM(A1:C1)\"); assert s.get(\"D1\")==\"error\"\ns.set(\"E1\",\"=COUNT(A1:B1)\"); assert s.get(\"E1\")==\"error\"\ns.set(\"F1\",\"=-B1\"); assert s.get(\"F1\")==\"error\"\nassert s.evaluate(\"=A1/0\")==\"error\"; assert s.evaluate(\"=SUM(A1:B1)\")==\"error\"\nassert s.evaluate(\"=A1+1\")==2; assert s.get(\"A1\")==1"
+      },
+      {
+        "name": "Malformed formulas, bad cells and reversed ranges",
+        "code": "s=Sheet()\nassert s.get(\"A1\")==0; assert s.evaluate(\"=1+2\")==3; assert s.evaluate(\"=7/0\")==\"error\"\nfor bad in [\"=B2:A1\",\"=SUM(A1:A1\",\"=A1+\",\"=FOO(A1:A2)\",\"=7 + B\",\"=2 3\",\"=2**2\",\"=A0\",\"=SUM()\",\n            \"=SUM(1)\",\"=A1:B1:C1\",\"=1.2.3\",\"=SUM(A1 A2)\",\"=A1:\",\"=A$1\",\"=A1+*2\"]:\n    try: s.set(\"Z1\",bad)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError for \"+bad)\nassert s.get(\"A1\")==0; assert s.get(\"Z1\")==0\nfor bad in [True,None,[1],\"1\",\"A1\",{\"a\":1}]:\n    try: s.set(\"A1\",bad)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError for \"+repr(bad))\nfor bad in [\"nonsense\",\"1A\",\"A\",\"\",None]:\n    try: s.set(bad,1)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError for \"+repr(bad))\nassert s.get(\"A1\")==0; assert s.set(\"a1\",3)==3; assert s.get(\"A1\")==3"
+      },
+      {
+        "name": "A rewrite reparses, and a blank block is not empty",
+        "code": "s=Sheet()\ns.set(\"A1\",\"=1+1\"); assert s.get(\"A1\")==2\ns.set(\"A1\",\"=3\"); assert s.get(\"A1\")==3\ns.set(\"A1\",\"=A1*10\"); assert s.get(\"A1\")==30\ns.set(\"A2\",\"=A1\"); assert s.get(\"A2\")==30\ns.set(\"B1\",\"=COUNT(A3:B4)\"); assert s.get(\"B1\")==4\ns.set(\"B2\",\"=SUM(A3:B4)\"); assert s.get(\"B2\")==0\ns.set(\"B3\",\"=AVG(A3:B4)\"); assert s.get(\"B3\")==0\ns.set(\"C1\",\"=A1\"); s.set(\"A1\",7)\nassert s.get(\"C1\")==30; assert s.get(\"A1\")==7\ns.set(\"A1\",\"=A1+1\"); assert s.get(\"A1\")==8\ns.set(\"C1\",5); assert s.get(\"C1\")==5\ns.set(\"D1\",\"=D1\"); assert s.get(\"D1\")==0\ns.set(\"D1\",4); s.set(\"D1\",\"=D1+1\"); assert s.get(\"D1\")==5\ntry: s.set(\"A1\",\"=A1+\")\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")\nassert s.get(\"A1\")==8; assert s.get(\"B1\")==4"
+      }
+    ],
+    "solution": "import re\n\nERROR = 'error'\nFUNCTIONS = ('SUM', 'MIN', 'MAX', 'AVG', 'COUNT')\nCELL = re.compile(r'([A-Za-z]+)([0-9]+)')\nTOKEN = re.compile(r'[0-9]+(?:\\.[0-9]+)?|[A-Za-z]+[0-9]*|[-+*/(),:]|\\s+')\nPRECEDENCE = {'+': 1, '-': 1, '*': 2, '/': 2}\nBINARY = {'+': lambda a, b: a + b, '-': lambda a, b: a - b, '*': lambda a, b: a * b,\n          '/': lambda a, b: ERROR if b == 0 else a / b}\nAGGREGATE = {'SUM': sum, 'MIN': min, 'MAX': max, 'COUNT': len,\n             'AVG': lambda values: sum(values) / len(values)}\n\n\ndef locate(ref):\n    \"\"\"Turn 'AA10' into (10, 27), the column being base 26, 1-based.\n\n    A cell is a (row, column) pair, so a range's ends decide its order.\n    \"\"\"\n    m = CELL.fullmatch(ref)\n    if not m or int(m.group(2)) < 1:\n        raise ValueError('Bad cell reference: ' + ref)\n    col = 0\n    for ch in m.group(1).upper():\n        col = col * 26 + (ord(ch) - 64)\n    return (int(m.group(2)), col)\n\n\ndef _classify(text):\n    if text[0] in '+-*/(),:':\n        return 'op', text\n    if '0' <= text[0] <= '9':\n        return 'num', float(text) if '.' in text else int(text)\n    # Letters followed by digits is a cell; letters alone is a name.\n    return ('ref' if '0' <= text[-1] <= '9' else 'name'), text.upper()\n\n\ndef tokenize(source):\n    \"\"\"One pass over the formula, refusing anything it does not recognise.\"\"\"\n    raw = TOKEN.findall(source)\n    if ''.join(raw) != source:\n        # findall skips what it cannot match, so compare coverage instead.\n        raise ValueError('Unexpected character in: ' + source)\n    return [_classify(text) for text in raw if text[0] not in ' \\t\\n\\r']\n\n\nclass Parser:\n    \"\"\"Recursive descent, recording every cell it read on the way past.\"\"\"\n\n    def __init__(self, tokens):\n        self.tokens = tokens\n        self.i = 0\n        self.refs = set()\n\n    def peek(self):\n        return self.tokens[self.i] if self.i < len(self.tokens) else None\n\n    def take(self, kind=None, value=None):\n        self.i += 1\n        if self.i > len(self.tokens):\n            raise ValueError('Formula ends early')\n        token = self.tokens[self.i - 1]\n        if kind is not None and token != (kind, value):\n            raise ValueError('Expected ' + value)\n        return token\n\n    def expression(self, floor=1):\n        node = self.unary()\n        while (token := self.peek()) and PRECEDENCE.get(token[1], 0) >= floor:\n            # Climb from the operator's own precedence, so 2 + 3 * 4 is\n            # 2 + (3 * 4) and never (2 + 3) * 4.\n            op = self.take()[1]\n            node = ('bin', op, node, self.expression(PRECEDENCE[op] + 1))\n        return node\n\n    def unary(self):\n        \"\"\"A primary, with as many leading minuses as the formula has.\"\"\"\n        kind, value = self.take()\n        if kind == 'num':\n            return ('num', value)\n        if kind == 'ref':\n            return self.reference(value)\n        if kind == 'name':\n            return self.call(value)\n        if value == '-':\n            # A leading minus is a multiply by -1, so -2 * 3 is (-2) * 3 and the\n            # tree only ever holds the two node kinds below.\n            return ('bin', '*', ('num', -1), self.unary())\n        if value != '(':\n            raise ValueError('Unexpected token: ' + repr(value))\n        node = self.expression()\n        self.take('op', ')')\n        return node\n\n    def reference(self, ref):\n        key = locate(ref)\n        self.refs.add(key)\n        if self.peek() != ('op', ':'):\n            return ('ref', key)\n        self.take()\n        nxt = self.take()\n        if nxt[0] != 'ref':\n            raise ValueError('A range needs a second cell')\n        span = (key, locate(nxt[1]))\n        if span[0] > span[1]:\n            # B2:A1 is a typo. Swapping the ends invents a range nobody wrote.\n            raise ValueError('Reversed range: ' + ref + ':' + nxt[1])\n        cells = [(row, col) for row in range(key[0], span[1][0] + 1)\n                 for col in range(key[1], span[1][1] + 1)]\n        self.refs.update(cells)\n        return ('range', cells)\n\n    def call(self, name):\n        if name not in FUNCTIONS:\n            raise ValueError('Unknown function: ' + name)\n        self.take('op', '(')\n        args = []\n        while self.peek() and self.peek()[0] == 'ref':\n            args.append(self.unary())\n            if self.peek() != ('op', ','):\n                break\n            self.take()\n        if not args:\n            # An argument is a cell or a range, never an expression, or\n            # SUM(A1*2) would quietly become a different question.\n            raise ValueError(name + ' takes a cell or range')\n        self.take('op', ')')\n        return ('call', name, args)\n\n\ndef parse(source):\n    parser = Parser(tokenize(source))\n    node = parser.expression()\n    if parser.i != len(parser.tokens):\n        # Dropped trailing junk turns a typo into a plausible answer.\n        raise ValueError('Trailing input in formula')\n    return node, parser.refs\n\n\nclass Sheet:\n    \"\"\"A spreadsheet whose formulas are a language: parse one, then run one.\n\n    A write is one evaluation and nothing knows what depends on what.\n    \"\"\"\n\n    def __init__(self):\n        self.values = {}\n\n    def get(self, cell):\n        # An unset cell reads as 0, the same value inside every formula.\n        return self.values.get(locate(str(cell)), 0)\n\n    def set(self, cell, value):\n        # A cell holds a number or an '= formula', nothing else.\n        if isinstance(value, str):\n            if not value.startswith('='):\n                raise ValueError('A text cell value must start with =')\n            # Parsed before anything is stored, so a bad one changes nothing.\n            value = self._eval(parse(value[1:])[0])\n        elif not isinstance(value, (int, float)) or isinstance(value, bool):\n            raise ValueError('A cell holds a number or a formula')\n        self.values[locate(str(cell))] = value\n        return value\n\n    def evaluate(self, formula):\n        # Ad hoc: it reads current values and stores nothing.\n        if not isinstance(formula, str) or not formula.startswith('='):\n            raise ValueError('A formula starts with =')\n        return self._eval(parse(formula[1:])[0])\n\n    def _eval(self, node):\n        kind = node[0]\n        if kind == 'num':\n            return node[1]\n        if kind == 'ref':\n            return self.values.get(node[1], 0)\n        if kind == 'range':\n            return [self.values.get(cell, 0) for cell in node[1]]\n        if kind == 'bin':\n            left, right = self._eval(node[2]), self._eval(node[3])\n            if left == ERROR or right == ERROR:\n                return ERROR  # One bad input poisons the whole expression.\n            return BINARY[node[1]](left, right)\n        values = []\n        for arg in node[2]:\n            flat = self._eval(arg)\n            values += flat if isinstance(flat, list) else [flat]\n        if ERROR in values:\n            return ERROR\n        return AGGREGATE[node[1]](values)\n",
+    "hints": [
+      "Two halves, in order: one pass to turn the text into tokens, then recursive descent over them.",
+      "Have the parser record every reference it sees on the way past. The dependency list is then free, which is what the next stage needs."
+    ],
+    "followups": [
+      "Stage 2: keep two maps of the dependency graph so a write recomputes only what it invalidates, and refuse a cycle.",
+      "Stage 3: batch the writes, recompute each dirty cell once, and prove that a rejected batch changes nothing.",
+      "Would you recompute synchronously in the request or on a worker, and what does the user see in each case?"
+    ],
+    "complexity": "Tokenizing and parsing are O(len(formula)) once, and one write evaluates that tree, reading the cells it names. Space is O(cells) for the values. There is no recompute step, because one write is one evaluation.",
+    "difficulty": "Hard"
+  },
+  {
+    "id": "sql",
+    "title": "SQL-like in-memory table store",
+    "topic": "Maps & sets",
+    "mode": "Build in stages",
+    "minutes": 45,
+    "starter": "class TableStore:\n    def insert(self, table, row):\n        pass\n\n    def update(self, table, key, changes):\n        pass\n\n    def delete(self, table, key):\n        pass\n\n    def select(self, table, where=None, order_by=None, desc=False, limit=None):\n        pass\n\n    def include_deleted(self, table):\n        pass\n\n    def history(self, table, key):\n        pass\n\n    def schema(self, table):\n        pass\n",
+    "statement": "Rows are dicts with an integer key column and values that are numbers, strings or None. insert replaces or resurrects a key, update merges and rejects a column outside schema(table) or a change to key, delete writes a tombstone no query sees. select filters with where(row), orders by order_by with missing first, numbers before strings and ties by key, reverses the whole list when desc, and keeps the first limit rows; with no order_by it returns ascending key order, as copies. Bad keys, values, columns and a negative limit raise ValueError.",
+    "examples": "insert(\"t\",{\"key\":1,\"v\":10}); delete(\"t\",1); select(\"t\") → []; include_deleted(\"t\") → [(1,None)]",
+    "tests": [
+      {
+        "name": "Insert, default order and a predicate",
+        "code": "s=TableStore()\ns.insert(\"users\",{\"key\":1,\"age\":30}); s.insert(\"users\",{\"key\":2,\"age\":25}); s.insert(\"users\",{\"key\":3,\"age\":40})\nassert [r[\"key\"] for r in s.select(\"users\")]==[1,2,3]\nassert s.select(\"users\",where=lambda r: r[\"age\"]>=30)==[{\"key\":1,\"age\":30},{\"key\":3,\"age\":40}]\nassert s.select(\"users\",where=lambda r: r[\"age\"]<0)==[]\nassert s.select(\"users\",where=lambda r: True)==[{\"key\":1,\"age\":30},{\"key\":2,\"age\":25},{\"key\":3,\"age\":40}]\nheld=s.select(\"users\")\ns.update(\"users\",1,{\"age\":31})\nassert held[0][\"age\"]==30; assert s.select(\"users\")[0]=={\"key\":1,\"age\":31}"
+      },
+      {
+        "name": "Order by with ties, missing values and both directions",
+        "code": "s=TableStore()\ns.insert(\"t\",{\"key\":2,\"score\":10,\"city\":\"b\"}); s.insert(\"t\",{\"key\":1,\"score\":10,\"city\":\"a\"})\ns.insert(\"t\",{\"key\":3,\"score\":5}); s.insert(\"t\",{\"key\":4})\nassert [r[\"key\"] for r in s.select(\"t\",order_by=\"score\")]==[4,3,1,2]\nassert [r[\"key\"] for r in s.select(\"t\",order_by=\"score\",desc=True)]==[2,1,3,4]\nassert [r[\"key\"] for r in s.select(\"t\",order_by=\"city\")]==[3,4,1,2]\nassert [r[\"key\"] for r in s.select(\"t\",order_by=\"nope\")]==[1,2,3,4]\ns.insert(\"t\",{\"key\":5,\"score\":7,\"city\":\"a\"})\nassert [r[\"key\"] for r in s.select(\"t\",order_by=\"score\")]==[4,3,5,1,2]\nassert [r[\"key\"] for r in s.select(\"t\",order_by=\"score\",limit=2)]==[4,3]\nassert [r[\"key\"] for r in s.select(\"t\",order_by=\"city\")]==[3,4,1,5,2]\ns.insert(\"t\",{\"key\":6,\"score\":\"aa\"})\nordered=[r[\"key\"] for r in s.select(\"t\",order_by=\"score\")]\nassert ordered[:5]==[4,3,5,1,2] and ordered[-1]==6"
+      },
+      {
+        "name": "Tombstones, resurrection and history",
+        "code": "s=TableStore()\ns.insert(\"t\",{\"key\":1,\"v\":10}); s.insert(\"t\",{\"key\":2,\"v\":20})\ns.delete(\"t\",1)\nassert s.select(\"t\")==[{\"key\":2,\"v\":20}]\nassert s.include_deleted(\"t\")==[(1,None),(2,{\"key\":2,\"v\":20})]\ns.delete(\"t\",1); s.delete(\"t\",9)\nassert s.include_deleted(\"t\")==[(1,None),(2,{\"key\":2,\"v\":20})]\ns.insert(\"t\",{\"key\":1,\"v\":11})\nassert s.select(\"t\")==[{\"key\":1,\"v\":11},{\"key\":2,\"v\":20}]\nassert s.include_deleted(\"t\")==[(1,{\"key\":1,\"v\":11}),(2,{\"key\":2,\"v\":20})]\ns.update(\"t\",1,{\"v\":12}); s.delete(\"t\",1)\nassert s.history(\"t\",1)==[{\"key\":1,\"v\":10},None,{\"key\":1,\"v\":11},{\"key\":1,\"v\":12},None]\nassert s.history(\"t\",2)==[{\"key\":2,\"v\":20}]; assert s.history(\"t\",9)==[]\nassert s.select(\"t\")==[{\"key\":2,\"v\":20}]"
+      },
+      {
+        "name": "Schema union and rejected writes",
+        "code": "s=TableStore()\nassert s.schema(\"t\")==[]\ns.insert(\"t\",{\"key\":1,\"age\":30}); s.insert(\"t\",{\"key\":2,\"score\":5})\nassert s.schema(\"t\")==[\"age\",\"key\",\"score\"]\nfor changes in [{\"rank\":7},{\"key\":9}]:\n    try: s.update(\"t\",1,changes)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError\")\nassert s.select(\"t\")==[{\"key\":1,\"age\":30},{\"key\":2,\"score\":5}]\nassert s.update(\"t\",2,{\"score\":6})=={\"key\":2,\"score\":6}\nassert s.update(\"t\",1,{\"age\":31})=={\"key\":1,\"age\":31}\nassert s.update(\"t\",99,{\"age\":1}) is None\ns.delete(\"t\",1); assert s.update(\"t\",1,{\"age\":32}) is None\nassert s.schema(\"t\")==[\"age\",\"key\",\"score\"]"
+      },
+      {
+        "name": "Empty, deleted-everything, oversized limit and table isolation",
+        "code": "s=TableStore()\nassert s.select(\"t\")==[]; assert s.include_deleted(\"t\")==[]; assert s.schema(\"t\")==[]; assert s.history(\"t\",1)==[]\ns.insert(\"t\",{\"key\":1}); s.insert(\"t\",{\"key\":2})\nassert len(s.select(\"t\",limit=99))==2; assert s.select(\"t\",limit=0)==[]\ntry: s.select(\"t\",limit=-1)\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")\nfor bad in [{\"age\":1},{\"key\":\"a\"}]:\n    try: s.insert(\"t\",bad)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError\")\ns.delete(\"t\",1); s.delete(\"t\",2)\nassert s.select(\"t\")==[] and s.schema(\"t\")==[\"key\"]\nassert s.include_deleted(\"t\")==[(1,None),(2,None)]\ns.insert(\"a\",{\"key\":1,\"age\":30}); s.insert(\"b\",{\"key\":1,\"score\":5})\nassert s.schema(\"a\")==[\"age\",\"key\"] and s.schema(\"b\")==[\"key\",\"score\"]\nassert [r[\"key\"] for r in s.select(\"b\",order_by=\"age\")]==[1]\nassert s.select(\"b\",where=lambda r: r.get(\"age\") is None)==[{\"key\":1,\"score\":5}]\ns.delete(\"a\",1)\nassert s.select(\"a\")==[] and [r[\"key\"] for r in s.select(\"b\")]==[1]\nassert s.include_deleted(\"a\")==[(1,None)] and s.include_deleted(\"b\")==[(1,{\"key\":1,\"score\":5})]"
+      }
+    ],
+    "solution": "RESERVED = 'key'\n\n\ndef rank_of(value):\n    \"\"\"Rank a column value into one total order.\n\n    A row without a value gets a rank of its own and so never reaches the\n    value comparison at all. Numbers rank before strings, which is what keeps\n    a mixed column sorting instead of raising on the first int/str pair.\n    \"\"\"\n    if value is None:\n        return (0, 0, 0)\n    if isinstance(value, (int, float)) and not isinstance(value, bool):\n        return (1, 0, value)\n    return (1, 1, value)\n\n\ndef sort_key(row, column):\n    # Ties fall back to the key, so two rows with the same column value always\n    # come back in the same order no matter how they were written.\n    return rank_of(row.get(column)) + (row[RESERVED],)\n\n\nclass TableStore:\n    \"\"\"Tables of rows keyed by a key column, with deletes kept as tombstones.\n\n    Every answer here is decided by the keys and the columns, never by the\n    order writes happened to arrive in, so replaying the same operations\n    always produces the same rows. That is what makes a query log worth\n    replaying in the first place.\n    \"\"\"\n\n    def __init__(self):\n        # table -> key -> (row, deleted flag)\n        self.rows = {}\n        # table -> key -> every version written, None marking each tombstone\n        self.versions = {}\n        # table -> every column ever seen, because columns are never dropped\n        self.columns = {}\n\n    def insert(self, table, row):\n        if not isinstance(row, dict) or RESERVED not in row:\n            raise ValueError('A row is a dict with a key column')\n        key = row[RESERVED]\n        if not isinstance(key, int) or isinstance(key, bool):\n            raise ValueError('Keys are integers')\n        for value in row.values():\n            if value is not None and not isinstance(value, (int, float, str)):\n                raise ValueError('Values are numbers, strings or None')\n        record = dict(row)\n        # Re-inserting a deleted key clears its tombstone instead of failing,\n        # so one key space stays one key space rather than splitting in two.\n        self.rows.setdefault(table, {})[key] = (record, False)\n        self.columns.setdefault(table, set()).update(row)\n        self.versions.setdefault(table, {}).setdefault(key, []).append(record)\n        return dict(record)\n\n    def update(self, table, key, changes):\n        record = self.rows.get(table, {}).get(key)\n        if record is None or record[1]:\n            return None\n        if RESERVED in changes:\n            raise ValueError('The key column is fixed')\n        seen = self.columns.get(table, ())\n        for column in changes:\n            if column not in seen:\n                # An update never invents a column. Otherwise a typo becomes\n                # a real column that nothing else agrees exists.\n                raise ValueError('Unknown column: ' + str(column))\n        # A new dict rather than an in-place change, so the previous version\n        # stays intact for history.\n        merged = dict(record[0])\n        merged.update(changes)\n        self.rows[table][key] = (merged, False)\n        self.versions.setdefault(table, {}).setdefault(key, []).append(merged)\n        return dict(merged)\n\n    def delete(self, table, key):\n        record = self.rows.get(table, {}).get(key)\n        if record is None or record[1]:\n            # Deleting what is not there changes nothing, tombstone log\n            # included, so a repeated delete cannot inflate the history.\n            return False\n        # The row stays where it is so history can still be reconstructed; only\n        # the flag moves, and every read path checks it.\n        self.rows[table][key] = (record[0], True)\n        self.versions.setdefault(table, {}).setdefault(key, []).append(None)\n        return True\n\n    def select(self, table, where=None, order_by=None, desc=False, limit=None):\n        if limit is not None and limit < 0:\n            raise ValueError('limit is a nonnegative integer')\n        rows = [\n            dict(row)\n            for row, deleted in self.rows.get(table, {}).values()\n            if not deleted\n        ]\n        if where is not None:\n            rows = [row for row in rows if where(row)]\n        if order_by is None:\n            rows.sort(key=lambda row: row[RESERVED])\n        else:\n            rows.sort(key=lambda row: sort_key(row, order_by))\n        if desc:\n            # Reversing the finished list rather than flipping each comparison\n            # keeps descending the exact mirror of ascending, ties included.\n            rows.reverse()\n        if limit is not None:\n            rows = rows[:limit]\n        return rows\n\n    def include_deleted(self, table):\n        \"\"\"(key, row) pairs by ascending key, None standing for a tombstone.\"\"\"\n        return [\n            (key, None if deleted else dict(row))\n            for key, (row, deleted) in sorted(self.rows.get(table, {}).items())\n        ]\n\n    def history(self, table, key):\n        \"\"\"Every version written for one key in write order, None per delete.\"\"\"\n        return [\n            None if row is None else dict(row)\n            for row in self.versions.get(table, {}).get(key, ())\n        ]\n\n    def schema(self, table):\n        # The union over every version, so a column that only one row ever had\n        # is still part of the table's shape.\n        return sorted(self.columns.get(table, ()))\n",
+    "hints": [
+      "Give every column value a total order, including the rows that do not have it.",
+      "A tombstone is a flag on the stored row, not a removal from the map."
+    ],
+    "followups": [
+      "Stage 2: replace the full scan with an index on (table, column) and let a predicate use it.",
+      "Stage 3: add count and group by aggregates, and pin down where their determinism breaks.",
+      "Can this store serve concurrent writers, and where exactly does isolation break?"
+    ],
+    "complexity": "insert and update O(columns in the row) to record a version and widen the schema; delete O(1). select O(n) to filter plus O(n log n) to sort. include_deleted O(n log n) to sort by key, history O(versions for that key), schema O(c). Space O(rows + versions).",
+    "difficulty": "Hard"
+  }
+]

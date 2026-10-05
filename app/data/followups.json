@@ -1,0 +1,1634 @@
+[
+  {
+    "id": "ttl",
+    "title": "TTL store with snapshots",
+    "statement": "Implement AdvancedTTLStore with set(key, value, now, ttl=None), get(key, now), delete(key, now) -> bool, scan(prefix, now) -> sorted list of (key, value), snapshot(now) -> independent dict of key: (value, remaining_ttl), restore(snapshot, now) and purge(now) -> number removed. delete reports whether the key was present and still live. scan returns only live keys, sorted by key. snapshot records remaining lifetime, not absolute expiry, and must not alias the live store. restore replaces all data and rebases each finite remaining lifetime onto now. As in the base problem, ttl=0 is immediately expired, missing or expired get returns None, values are strings and timestamps are nondecreasing.",
+    "starter": "class AdvancedTTLStore:\n    # Implement the methods in the contract.\n    pass\n",
+    "solution": "class AdvancedTTLStore:\n    \"\"\"A TTL store that can also be scanned, swept, snapshotted and restored.\n\n    It keeps the base contract: every method takes the current time, the\n    expiration boundary is inclusive, and ttl=None means \"never\".\n    \"\"\"\n\n    def __init__(self):\n        # key -> (value, expires_at), where expires_at is None for \"never\".\n        self._entries = {}\n\n    def set(self, key, value, now, ttl=None):\n        # One record per key, so an overwrite replaces the expiration too.\n        expires_at = None if ttl is None else now + ttl\n        self._entries[key] = (value, expires_at)\n\n    def get(self, key, now):\n        entry = self._entries.get(key)\n        if entry is None:\n            return None\n\n        value, expires_at = entry\n        if expires_at is not None and now >= expires_at:\n            del self._entries[key]\n            return None\n\n        return value\n\n    def delete(self, key, now):\n        # Liveness first: deleting a key that has already expired is a no-op\n        # and must report False rather than quietly succeeding.\n        if self.get(key, now) is None:\n            return False\n\n        del self._entries[key]\n        return True\n\n    def purge(self, now):\n        # The one place expired entries are dropped eagerly.\n        expired = [\n            key\n            for key, (_, expires_at) in self._entries.items()\n            if expires_at is not None and now >= expires_at\n        ]\n        for key in expired:\n            del self._entries[key]\n        return len(expired)\n\n    def scan(self, prefix, now):\n        # Sweep first, otherwise expired keys would sort into the result.\n        self.purge(now)\n        return sorted(\n            (key, value)\n            for key, (value, _) in self._entries.items()\n            if key.startswith(prefix)\n        )\n\n    def snapshot(self, now):\n        # Record remaining lifetime, not absolute expiry, so the snapshot is\n        # still meaningful when it is restored at a different time. Rebuilding\n        # each tuple is also what stops the snapshot aliasing the live store.\n        self.purge(now)\n        return {\n            key: (value, None if expires_at is None else expires_at - now)\n            for key, (value, expires_at) in self._entries.items()\n        }\n\n    def restore(self, snapshot, now):\n        # Rebase each remaining lifetime onto the restore time.\n        self._entries = {\n            key: (value, None if ttl is None else now + ttl)\n            for key, (value, ttl) in snapshot.items()\n        }\n",
+    "tests": [
+      {
+        "name": "Scan/delete boundaries",
+        "code": "s=AdvancedTTLStore(); s.set(\"ab\",\"1\",0,2); s.set(\"aa\",\"2\",0); assert s.scan(\"a\",1)==[(\"aa\",\"2\"),(\"ab\",\"1\")]; assert not s.delete(\"ab\",2); assert s.delete(\"aa\",2); assert not s.delete(\"aa\",2)"
+      },
+      {
+        "name": "Snapshot lifetime and isolation",
+        "code": "s=AdvancedTTLStore(); s.set(\"x\",\"v\",0,10); snap=s.snapshot(4); s.set(\"x\",\"new\",5); s.restore(snap,100); assert s.get(\"x\",105)==\"v\"; assert s.get(\"x\",106) is None; assert snap=={\"x\":(\"v\",6)}"
+      },
+      {
+        "name": "Active reclamation",
+        "code": "s=AdvancedTTLStore(); s.set(\"a\",\"v\",0,1); s.set(\"b\",\"v\",0); assert s.purge(1)==1; assert s.purge(2)==0; assert s.get(\"b\",2)==\"v\""
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=AdvancedTTLStore(); s.set(\"a\",\"old\",0,3); snap=s.snapshot(1); s.set(\"a\",\"new\",2); s.restore(snap,10); assert s.get(\"a\",11)==\"old\"; assert s.get(\"a\",12) is None; assert not s.delete(\"a\",12); assert s.scan(\"\",12)==[]"
+      }
+    ],
+    "complexity": "get/set/delete average O(1); purge/snapshot O(n); scan O(n + r log r); O(n) storage.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: implement delete and prefix scan with sorted live keys.",
+        "answer": "Delete must test liveness, and scans must filter expired keys before lexicographic sorting. The lab implements both.",
+        "checks": [
+          "Delete an expired key twice: both return False.",
+          "Compare an empty prefix scan with all live keys."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: add snapshot/restore that preserves remaining TTL.",
+        "answer": "Snapshot remaining TTL, not absolute expiry. On restore at r, a remaining lifetime d becomes r+d. Copy snapshot records to avoid aliasing.",
+        "checks": [
+          "Restore far in the future and check exact expiration.",
+          "Mutate live data after snapshot and verify snapshot is unchanged."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "How would you reclaim keys that are never read again?",
+        "answer": "The lab exposes an explicit sweep so unread keys can be reclaimed. In production use a periodic bounded sweep or expiry min-heap with key generation numbers; stale heap entries from overwrites must not delete a newer value.",
+        "checks": [
+          "Overwrite a short TTL with a longer one before the old expiry.",
+          "Measure reclamation lag and bound sweep work per tick."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "limiter",
+    "title": "Weighted per-client quotas",
+    "statement": "Implement WeightedLimiter(policies), where policies maps client -> (positive limit, positive window). allow(client, now, weight=1) returns bool, charging only accepted positive integer weights in (now-window,now]. Unknown client raises KeyError; weight<=0 raises ValueError. Timestamps are nondecreasing. Also implement TokenBucket(capacity, refill_per_second), initially full at time 0; allow(now,weight=1) refills continuously, capped at capacity, and charges only accepted positive weights.",
+    "starter": "class WeightedLimiter:\n    pass\n\nclass TokenBucket:\n    pass\n",
+    "solution": "from collections import defaultdict, deque\n\n\nclass WeightedLimiter:\n    \"\"\"A per-client sliding window where each request costs more than one.\n\n    The window is the same as the base problem, but capacity is consumed by\n    weight rather than by request count, and a rejected request costs nothing.\n    \"\"\"\n\n    def __init__(self, policies):\n        self.policies = dict(policies)\n        # Accepted (time, weight) pairs, oldest first, per client.\n        self.queues = defaultdict(deque)\n        # The running weight inside the window, so allow() stays O(1).\n        self.totals = defaultdict(int)\n\n    def allow(self, client, now, weight=1):\n        if weight <= 0:\n            raise ValueError('Positive weight required')\n        # An unknown client raises KeyError from the policy lookup.\n        limit, window = self.policies[client]\n        q = self.queues[client]\n\n        # Half-open window: a request exactly `window` old has fallen out.\n        while q and q[0][0] <= now - window:\n            _, old = q.popleft()\n            self.totals[client] -= old\n\n        if self.totals[client] + weight > limit:\n            # Rejected, and so charged nothing.\n            return False\n        q.append((now, weight))\n        self.totals[client] += weight\n        return True\n\n\nclass TokenBucket:\n    \"\"\"A continuously refilling allowance, which the window deliberately is not.\n\n    Because tokens accrue smoothly, this admits a client that has just spent\n    its whole quota, where the sliding window would refuse it. That\n    difference is the point of implementing both.\n    \"\"\"\n\n    def __init__(self, capacity, refill_per_second):\n        self.capacity = capacity\n        self.rate = refill_per_second\n        # Starts completely full at time 0.\n        self.tokens = capacity\n        self.last = 0\n\n    def allow(self, now, weight=1):\n        if weight <= 0:\n            raise ValueError('Positive weight required')\n        # Refill for the elapsed time, never past the cap.\n        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)\n        self.last = now\n        if weight > self.tokens:\n            return False\n        self.tokens -= weight\n        return True\n",
+    "tests": [
+      {
+        "name": "Weighted rejection does not charge",
+        "code": "r=WeightedLimiter({\"a\":(5,10),\"b\":(1,2)}); assert r.allow(\"a\",0,3); assert not r.allow(\"a\",1,3); assert r.allow(\"a\",2,2); assert not r.allow(\"a\",9); assert r.allow(\"a\",10,3); assert r.allow(\"b\",10)"
+      },
+      {
+        "name": "Policy and weight errors",
+        "code": "r=WeightedLimiter({\"a\":(1,1)})\nfor client,weight,error in [(\"z\",1,KeyError),(\"a\",0,ValueError)]:\n    try: r.allow(client,0,weight)\n    except error: pass\n    else: raise AssertionError(\"Expected error\")"
+      },
+      {
+        "name": "Bucket refill versus window",
+        "code": "b=TokenBucket(4,1); r=WeightedLimiter({\"a\":(4,4)}); assert b.allow(0,4) and r.allow(\"a\",0,4); assert b.allow(1,1); assert not r.allow(\"a\",1,1); assert not b.allow(1,1); assert b.allow(100,4); assert not b.allow(100,1)"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "r=WeightedLimiter({\"a\":(3,5)}); assert r.allow(\"a\",0,3); assert not r.allow(\"a\",4,1); assert r.allow(\"a\",5,3); b=TokenBucket(2,1); assert b.allow(0,2); assert not b.allow(.5,1); assert b.allow(1,1)"
+      }
+    ],
+    "complexity": "Sliding quota amortized O(1) per accepted request, O(retained requests) memory. Token bucket O(1) time/space.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: weighted requests and per-client policies.",
+        "answer": "Store timestamp/weight pairs and a running sum per client. Expire weights before admission. Reject oversize requests without changing the total.",
+        "checks": [
+          "Check independent client policies.",
+          "Check exact expiration after a rejected request."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: compare token bucket bursts with strict sliding windows.",
+        "answer": "A bucket allows bursts up to capacity and gradually refills. A strict sliding window keeps the entire accepted weight until it leaves the window. The paired implementations expose the difference at t=1 after a full burst.",
+        "checks": [
+          "Drain at t=0, retry at t=1.",
+          "After a long idle period tokens must not exceed capacity."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Discuss atomicity across multiple application servers.",
+        "answer": "Expire/check/charge must be one atomic operation for the same quota key. Use a transaction or server-side script on the owning shard. Across regions choose coordinated admission or bounded regional token leases; independent full quotas multiply the allowed total.",
+        "checks": [
+          "Race two requests for the last token: exactly one succeeds.",
+          "Partition regions and calculate a bound on overshoot."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "lru",
+    "title": "Weighted expiring LRU",
+    "statement": "Implement AdvancedLRU(capacity_bytes) with get(key,now)->value or -1 and put(key,value,size,now,ttl=None)->bool. size is a nonnegative explicit byte cost; capacity is nonnegative. Expire keys before operations, including unread keys. Expiry is exclusive. Successful reads/writes update recency. An oversize put returns False and preserves the old value of that key. ttl=0 writes an immediately expired entry. Use a map plus a manually implemented doubly linked list; no OrderedDict.",
+    "starter": "class AdvancedLRU:\n    pass\n",
+    "solution": "class Node:\n    \"\"\"One cache entry, doubly linked so it can be unlinked in constant time.\"\"\"\n\n    def __init__(self, key=None, value=None, size=0, expiry=None):\n        self.key = key\n        self.value = value\n        self.size = size\n        self.expiry = expiry\n        self.prev = None\n        self.next = None\n\n\nclass AdvancedLRU:\n    \"\"\"A response cache bounded by bytes, with per-entry expiry.\n\n    Recency is a hand-written doubly linked list: root.prev is the most\n    recently used entry and root.next is the least, which makes eviction the\n    leftmost node. A dict maps keys to nodes for lookup.\n    \"\"\"\n\n    def __init__(self, capacity_bytes):\n        self.capacity = capacity_bytes\n        self.used = 0\n        self.nodes = {}\n        # A sentinel node, so first and last need no special cases.\n        self.root = Node()\n        self.root.prev = self.root.next = self.root\n\n    def _unlink(self, node):\n        node.prev.next = node.next\n        node.next.prev = node.prev\n\n    def _recent(self, node):\n        \"\"\"Move a node to the most-recently-used end.\"\"\"\n        node.prev = self.root.prev\n        node.next = self.root\n        self.root.prev.next = node\n        self.root.prev = node\n\n    def _remove(self, node):\n        self._unlink(node)\n        self.used -= node.size\n        del self.nodes[node.key]\n\n    def _expire(self, now):\n        # Expiry is independent of recency, so a sweep over the map is far\n        # simpler than pruning the list in expiry order. That is wrong the\n        # other way round: the newest entry can be the first to expire.\n        for node in list(self.nodes.values()):\n            if node.expiry is not None and node.expiry <= now:\n                self._remove(node)\n\n    def get(self, key, now):\n        self._expire(now)\n        if key not in self.nodes:\n            return -1\n        node = self.nodes[key]\n        self._unlink(node)\n        self._recent(node)\n        return node.value\n\n    def put(self, key, value, size, now, ttl=None):\n        self._expire(now)\n        if size > self.capacity:\n            # Refused outright, and the previous value for this key is left\n            # exactly as it was.\n            return False\n        if key in self.nodes:\n            # Replacing an entry, not adding one.\n            self._remove(self.nodes[key])\n        if ttl == 0:\n            # Stored and immediately expired: the return value reports that\n            # the write was accepted, not that the entry is readable.\n            return True\n        # Budget is consumed by size, so one eviction may not be enough.\n        while self.used + size > self.capacity:\n            self._remove(self.root.next)\n        node = Node(key, value, size, None if ttl is None else now + ttl)\n        self.nodes[key] = node\n        self.used += size\n        self._recent(node)\n        return True\n",
+    "tests": [
+      {
+        "name": "Byte eviction and recency",
+        "code": "c=AdvancedLRU(5); c.put(\"a\",1,2,0); c.put(\"b\",2,2,0); assert c.get(\"a\",0)==1; c.put(\"c\",3,3,1); assert c.get(\"b\",1)==-1; assert c.get(\"a\",1)==1"
+      },
+      {
+        "name": "Expiry before eviction",
+        "code": "c=AdvancedLRU(4); c.put(\"a\",1,2,0,1); c.put(\"b\",2,2,0); c.put(\"c\",3,2,1); assert c.get(\"a\",1)==-1; assert c.get(\"b\",1)==2"
+      },
+      {
+        "name": "Oversize, overwrite, zero",
+        "code": "c=AdvancedLRU(2); c.put(\"a\",1,2,0); assert not c.put(\"a\",9,3,1); assert c.get(\"a\",1)==1; c.put(\"a\",2,1,2,0); assert c.get(\"a\",2)==-1; z=AdvancedLRU(0); assert z.put(\"z\",0,0,0); assert z.get(\"z\",0)==0"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "c=AdvancedLRU(3); assert c.put(\"a\",1,2,0); assert not c.put(\"a\",9,4,1); assert c.get(\"a\",1)==1; assert c.put(\"b\",2,1,1,ttl=1); assert c.get(\"b\",2)==-1; assert c.get(\"a\",2)==1"
+      }
+    ],
+    "complexity": "List recency and lookup O(1); this simple expiry sweep costs O(n) per operation. An expiry heap can replace the sweep at O(log n) per expiring write; O(n) storage.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: implement using a hash map and doubly linked list.",
+        "answer": "A sentinel list removes empty-list edge cases. Lookup returns a node; unlink/reinsert moves it to MRU; the sentinel next node is LRU.",
+        "checks": [
+          "Evict after a successful get.",
+          "Repeatedly overwrite a key without duplicating list nodes."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: add TTL and byte-size limits.",
+        "answer": "Track explicit size separately from entry count. Purge expiration before capacity eviction. Reject oversize updates before removing the old entry.",
+        "checks": [
+          "Expire the LRU before inserting another key.",
+          "Reject an oversize overwrite and check the old value remains."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Discuss cache stampedes and concurrent get-or-load.",
+        "answer": "Coalesce concurrent misses with one in-flight future per key. Publish cache values only after successful loads; remove the in-flight record on success, error and cancellation. Use a lock for state transitions, but release it before slow I/O. Define whether one caller cancellation cancels the shared load.",
+        "checks": [
+          "100 simultaneous misses should start one load.",
+          "A failed load must permit a subsequent retry."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "temporal",
+    "title": "Out-of-order version history",
+    "statement": "Implement History.set(key,value,timestamp), get(key,timestamp), pin(timestamp), unpin(timestamp), compact(cutoff), and version_count(key). Duplicate timestamps overwrite. compact keeps all versions >= cutoff plus the latest version at or before cutoff and at or before each pinned timestamp. Queries at pinned timestamps and >= cutoff remain valid; other old queries are no longer guaranteed. pin is only called before compaction of the relevant history.",
+    "starter": "class History:\n    pass\n",
+    "solution": "from bisect import bisect_left, bisect_right\n\n\nclass History:\n    \"\"\"Version history per key, with out-of-order writes and compaction.\n\n    Each key keeps parallel sorted lists of timestamps and values, so a read\n    is a binary search and a compaction is a single pass over that key.\n    \"\"\"\n\n    def __init__(self):\n        self.data = {}\n        self.pins = set()\n\n    def set(self, key, value, timestamp):\n        times, values = self.data.setdefault(key, ([], []))\n        i = bisect_left(times, timestamp)\n        if i < len(times) and times[i] == timestamp:\n            # Writing the same timestamp twice overwrites that version.\n            values[i] = value\n        else:\n            times.insert(i, timestamp)\n            values.insert(i, value)\n\n    def get(self, key, timestamp):\n        times, values = self.data.get(key, ([], []))\n        # Rightmost timestamp at or before the query.\n        i = bisect_right(times, timestamp) - 1\n        return values[i] if i >= 0 else None\n\n    def pin(self, timestamp):\n        self.pins.add(timestamp)\n\n    def unpin(self, timestamp):\n        self.pins.discard(timestamp)\n\n    def compact(self, cutoff):\n        for key, (times, values) in list(self.data.items()):\n            # Everything at or after the cutoff is always kept.\n            keep = set(range(bisect_left(times, cutoff), len(times)))\n            # Plus one boundary version below the cutoff, and one below each\n            # pin. A pin usually falls in a gap, so the version *at or before*\n            # it is what answers the query, not one written at it.\n            for t in self.pins | {cutoff}:\n                i = bisect_right(times, t) - 1\n                if i >= 0:\n                    keep.add(i)\n            indices = sorted(keep)\n            self.data[key] = (\n                [times[i] for i in indices],\n                [values[i] for i in indices],\n            )\n\n    def version_count(self, key):\n        return len(self.data.get(key, ([], []))[0])\n",
+    "tests": [
+      {
+        "name": "Out of order and replacement",
+        "code": "h=History(); h.set(\"x\",\"c\",3); h.set(\"x\",\"a\",1); h.set(\"x\",\"b\",2); h.set(\"x\",\"B\",2); assert h.get(\"x\",2)==\"B\"; assert h.version_count(\"x\")==3; assert h.get(\"x\",0) is None"
+      },
+      {
+        "name": "Pinned predecessor retained",
+        "code": "h=History(); [h.set(\"x\",str(i),i) for i in range(1,11)]; h.pin(3); h.compact(8); assert h.get(\"x\",3)==\"3\"; assert h.get(\"x\",8)==\"8\"; assert h.version_count(\"x\")==4; h.unpin(3); h.compact(8); assert h.version_count(\"x\")==3"
+      },
+      {
+        "name": "Cutoff between versions",
+        "code": "h=History(); h.set(\"x\",\"a\",1); h.set(\"x\",\"b\",5); h.compact(3); assert h.get(\"x\",3)==\"a\"; assert h.get(\"x\",9)==\"b\""
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=History(); s.set(\"x\",\"a\",1); s.set(\"x\",\"b\",3); s.set(\"x\",\"c\",5); s.pin(1); s.compact(5); assert s.get(\"x\",1)==\"a\"; assert s.get(\"x\",5)==\"c\"; s.unpin(1); s.compact(5); assert s.version_count(\"x\")==1"
+      }
+    ],
+    "complexity": "List insertion O(n), lookup O(log n); compaction O(n + pins log n) per key plus sorting retained indices.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: support out-of-order writes and duplicate timestamps.",
+        "answer": "Use binary insertion and exact-timestamp replacement. A balanced search tree avoids shifting arrays for high write volume.",
+        "checks": [
+          "Insert timestamps 3,1,2 and overwrite 2.",
+          "Query before the first write."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: compact history while honoring active snapshots.",
+        "answer": "A snapshot only needs its visible predecessor version, not every intervening version. Retain those predecessors plus current history. Coordinate pin registration with compaction; otherwise a newly registered reader can require a version already deleted.",
+        "checks": [
+          "Pin a timestamp between writes.",
+          "Unpin, compact again, and show retained history shrinks."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "transactions",
+    "title": "Transactional value counts",
+    "statement": "Implement CountStore with the original get/set/delete/begin/commit/rollback behavior plus count(value)->number of currently visible keys with that value. Values are strings. count must be average O(1), without scanning keys. Nested commit affects only the innermost transaction. Invalid commit/rollback raise ValueError.",
+    "starter": "class CountStore:\n    pass\n",
+    "solution": "from collections import Counter\n\n\nclass CountStore:\n    \"\"\"A transactional key-value store that can also count values.\n\n    Values are visible immediately, so the counts have to track reads and\n    writes exactly. Every change is remembered per transaction so that a\n    rollback can put the previous values back, and a commit hands the changes\n    to the enclosing transaction rather than applying them outright.\n    \"\"\"\n\n    def __init__(self):\n        self.data = {}\n        # value -> how many visible keys currently hold it.\n        self.counts = Counter()\n        # One dict of key -> previous value per open transaction.\n        self.undo = []\n        # A sentinel, because None is a legal value to store.\n        self.missing = object()\n\n    def get(self, key):\n        return self.data.get(key)\n\n    def count(self, value):\n        return self.counts[value]\n\n    def _write(self, key, value):\n        \"\"\"Set a key, keeping the counts in step. `missing` deletes it.\"\"\"\n        old = self.data.get(key, self.missing)\n        if old is not self.missing:\n            self.counts[old] -= 1\n            # Drop the entry entirely so count(value) reports 0 cleanly.\n            if not self.counts[old]:\n                del self.counts[old]\n\n        if value is self.missing:\n            self.data.pop(key, None)\n        else:\n            self.data[key] = value\n            self.counts[value] += 1\n\n    def _remember(self, key):\n        \"\"\"Record a key's value before changing it, for a later rollback.\"\"\"\n        if self.undo:\n            # setdefault, not assignment: the oldest recorded value is the one\n            # a rollback has to restore.\n            self.undo[-1].setdefault(key, self.data.get(key, self.missing))\n\n    def set(self, key, value):\n        self._remember(key)\n        self._write(key, value)\n\n    def delete(self, key):\n        self._remember(key)\n        self._write(key, self.missing)\n\n    def begin(self):\n        self.undo.append({})\n\n    def commit(self):\n        if not self.undo:\n            raise ValueError('No transaction')\n        changes = self.undo.pop()\n        if self.undo:\n            # Nested: hand the recorded previous values up to the parent, so\n            # rolling the parent back still restores the original values.\n            for key, old in changes.items():\n                self.undo[-1].setdefault(key, old)\n\n    def rollback(self):\n        if not self.undo:\n            raise ValueError('No transaction')\n        # Replay in reverse, so two writes to one key unwind correctly.\n        for key, old in reversed(list(self.undo.pop().items())):\n            self._write(key, old)\n",
+    "tests": [
+      {
+        "name": "Overwrite and count",
+        "code": "s=CountStore(); s.set(\"a\",\"x\"); s.set(\"b\",\"x\"); assert s.count(\"x\")==2; s.set(\"a\",\"y\"); assert s.count(\"x\")==1; assert s.count(\"y\")==1; s.delete(\"missing\"); assert s.count(\"z\")==0"
+      },
+      {
+        "name": "Nested commit then rollback",
+        "code": "s=CountStore(); s.set(\"a\",\"x\"); s.begin(); s.set(\"a\",\"y\"); s.begin(); s.set(\"b\",\"y\"); s.commit(); assert s.count(\"y\")==2; s.rollback(); assert s.count(\"x\")==1; assert s.count(\"y\")==0; assert s.get(\"b\") is None"
+      },
+      {
+        "name": "Repeated writes and invalid scope",
+        "code": "s=CountStore(); s.begin(); s.set(\"a\",\"x\"); s.set(\"a\",\"y\"); s.delete(\"a\"); s.rollback(); assert s.count(\"x\")==s.count(\"y\")==0\ntry: s.commit()\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=CountStore(); s.set(\"a\",\"v\"); s.set(\"b\",\"v\"); s.begin(); s.delete(\"a\"); s.begin(); s.set(\"b\",\"w\"); s.commit(); assert s.count(\"v\")==0; assert s.count(\"w\")==1; s.rollback(); assert s.count(\"v\")==2 and s.count(\"w\")==0"
+      }
+    ],
+    "complexity": "get/count/set/delete O(1) average; rollback/commit O(changed keys); storage O(keys + undo records).",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: count keys equal to a value without scanning the store.",
+        "answer": "Maintain one visible map and a frequency counter. Each transaction remembers the first previous value for every changed key. Rollback restores those values through the same counter-updating function. Nested commit merges undo records without replacing older parent originals.",
+        "checks": [
+          "Repeated changes to the same key must restore its pre-transaction value.",
+          "Deleting a missing key must not create a count."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: discuss isolation when two clients write concurrently.",
+        "answer": "This in-memory object gives no multi-client isolation. Add serializable transactions via locking, or MVCC with validation of read/write sets. Snapshot isolation alone permits write skew when two transactions update different rows after reading a shared invariant.",
+        "checks": [
+          "Run two withdrawals against one balance.",
+          "Use two on-call rows to demonstrate write skew and prevent it with a predicate lock or serializable validation."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "scheduler",
+    "title": "Parallel dependency execution",
+    "statement": "Implement schedule(tasks, dependencies, workers) -> dict task:(start,end). tasks maps unique names to nonnegative durations. At each event time, finish ALL tasks ending then, then start lexicographically smallest ready tasks until workers are full. Zero-duration tasks finish at that same time and unlock dependents. Duplicate edges count once. Raise ValueError for workers<1 or a cycle. Every dependency names an existing task.",
+    "starter": "def schedule(tasks, dependencies, workers):\n    pass\n",
+    "solution": "import heapq\nfrom collections import defaultdict\n\n\ndef schedule(tasks, dependencies, workers):\n    \"\"\"Run a dependency graph on a fixed pool of workers.\n\n    This is a simulation over event times rather than a loop over tasks,\n    because several tasks can finish at the same instant and the order they\n    are resolved in decides who gets a worker.\n    \"\"\"\n    if workers < 1:\n        raise ValueError('Positive workers required')\n\n    edges = defaultdict(set)\n    degree = dict.fromkeys(tasks, 0)\n    for a, b in dependencies:\n        # Deduplicate before counting, or a repeated edge leaves the\n        # dependent's indegree permanently above zero.\n        if b not in edges[a]:\n            edges[a].add(b)\n            degree[b] += 1\n\n    # Ready tasks in name order, so the lexicographic rule falls out of the\n    # heap rather than needing a sort.\n    ready = [t for t in tasks if degree[t] == 0]\n    heapq.heapify(ready)\n    # Running tasks keyed by end time.\n    active = []\n    result = {}\n    now = 0\n\n    while ready or active:\n        # Start whatever fits in the pool, newest event time first.\n        while ready and len(active) < workers:\n            task = heapq.heappop(ready)\n            end = now + tasks[task]\n            result[task] = (now, end)\n            heapq.heappush(active, (end, task))\n            if end == now:\n                # A zero-duration task occupies this instant only; let the\n                # loop reconsider before starting anything else.\n                break\n\n        if active and (not ready or len(active) == workers or active[0][0] == now):\n            # Advance to the next event time.\n            now = active[0][0]\n            # Finish everything ending now before starting anything, so a\n            # zero-duration task can unlock its dependents immediately.\n            while active and active[0][0] == now:\n                _, task = heapq.heappop(active)\n                for nxt in edges[task]:\n                    degree[nxt] -= 1\n                    if degree[nxt] == 0:\n                        heapq.heappush(ready, nxt)\n\n    if len(result) != len(tasks):\n        raise ValueError('Cycle')\n    return result\n",
+    "tests": [
+      {
+        "name": "Parallel execution and tie",
+        "code": "assert schedule({\"a\":2,\"b\":1,\"c\":2,\"d\":1},[(\"a\",\"d\"),(\"b\",\"d\")],2)=={\"a\":(0,2),\"b\":(0,1),\"c\":(1,3),\"d\":(2,3)}"
+      },
+      {
+        "name": "Zero duration and duplicates",
+        "code": "assert schedule({\"a\":0,\"b\":1},[(\"a\",\"b\"),(\"a\",\"b\")],1)=={\"a\":(0,0),\"b\":(0,1)}; assert schedule({},[],1)=={}"
+      },
+      {
+        "name": "Cycle and invalid worker count",
+        "code": "for args in [({\"a\":1},[(\"a\",\"a\")],1),({},[],0)]:\n    try: schedule(*args)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError\")"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "assert schedule({\"a\":0,\"b\":0,\"c\":2},[(\"a\",\"b\"),(\"b\",\"c\")],1)=={\"a\":(0,0),\"b\":(0,0),\"c\":(0,2)}; assert schedule({},[],2)=={}"
+      }
+    ],
+    "complexity": "O(E + V log V) time, O(V+E) space.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: execute with N workers and task durations.",
+        "answer": "Use a ready min-heap and a completion min-heap. Advance simulated time to the next completion rather than ticking each time unit. Release every simultaneous completion before selecting the next task.",
+        "checks": [
+          "Compare one worker with many workers.",
+          "Include zero-duration chains and simultaneous completions."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: handle failures, retries, cancellation, and dynamic dependencies.",
+        "answer": "Use explicit pending/running/succeeded/failed/cancelled states and attempt IDs. Only a successful final attempt satisfies dependencies. Retries retain logical task identity but get new attempt fencing tokens. Cancellation must propagate to queued descendants or mark them blocked. Accept dynamic edges only before a task starts, validate cycles atomically, and reject impossible mutations.",
+        "checks": [
+          "Late success from an old attempt must not override a new attempt.",
+          "Add an edge that creates a cycle and verify no state changes.",
+          "Cancel a running prerequisite while a dependent is queued."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "merge",
+    "title": "Lazy merge with event-time watermark",
+    "statement": "Implement merge_lazy(streams) as an iterator over sorted (timestamp,payload) iterables, ordered by timestamp then stream index; do not materialize input. Also implement WatermarkBuffer(max_events): add(event)->None buffers an event, raises ValueError if timestamp<=last watermark or watermark would be violated, and OverflowError if full; advance(watermark)->sorted list of all buffered events with timestamp<=watermark (arrival order breaks ties). Watermarks cannot decrease. Initial watermark is negative infinity. Rejected adds leave state unchanged.",
+    "starter": "def merge_lazy(streams):\n    pass\n\nclass WatermarkBuffer:\n    pass\n",
+    "solution": "import heapq\n\n\ndef merge_lazy(streams):\n    \"\"\"Merge sorted event streams lazily.\n\n    Nothing is read from a stream until it has to be, so this works over\n    iterables that cannot be held in memory. Ordering is by timestamp, then by\n    stream index, so equal timestamps keep their shard order.\n    \"\"\"\n    iterators = [iter(s) for s in streams]\n    heap = []\n    # Seed the heap with the head of each stream.\n    for i, it in enumerate(iterators):\n        event = next(it, None)\n        if event is not None:\n            heapq.heappush(heap, (event[0], i, event))\n    while heap:\n        _, i, event = heapq.heappop(heap)\n        yield event\n        # Replace the exhausted stream's head with its successor.\n        nxt = next(iterators[i], None)\n        if nxt is not None:\n            heapq.heappush(heap, (nxt[0], i, nxt))\n\n\nclass WatermarkBuffer:\n    \"\"\"Buffers events until a watermark says they can no longer be overtaken.\n\n    The watermark is the system's promise that no event with a timestamp at\n    or below it will ever arrive again. Enforcing that on the way in is what\n    keeps the released order stable.\n    \"\"\"\n\n    def __init__(self, max_events):\n        self.limit = max_events\n        self.heap = []\n        # No watermark yet.\n        self.watermark = float('-inf')\n        # A sequence number, so equal timestamps keep arrival order.\n        self.seq = 0\n\n    def add(self, event):\n        if event[0] <= self.watermark:\n            raise ValueError('Late event')\n        if len(self.heap) >= self.limit:\n            raise OverflowError('Buffer full')\n        heapq.heappush(self.heap, (event[0], self.seq, event))\n        self.seq += 1\n\n    def advance(self, watermark):\n        if watermark < self.watermark:\n            raise ValueError('Watermark decreased')\n        self.watermark = watermark\n        out = []\n        while self.heap and self.heap[0][0] <= watermark:\n            out.append(heapq.heappop(self.heap)[2])\n        return out\n",
+    "tests": [
+      {
+        "name": "Stable lazy merge",
+        "code": "assert list(merge_lazy([iter([(1,\"z\"),(1,\"y\")]),iter([(1,\"a\")])]))==[(1,\"z\"),(1,\"y\"),(1,\"a\")]; assert list(merge_lazy([]))==[]"
+      },
+      {
+        "name": "Limited lookahead",
+        "code": "reads=[]\ndef stream():\n    for i in range(100): reads.append(i); yield (i,\"x\")\ng=merge_lazy([stream()]); assert reads==[]; assert next(g)==(0,\"x\"); assert len(reads)==1"
+      },
+      {
+        "name": "Watermarks and bounded buffer",
+        "code": "b=WatermarkBuffer(2); b.add((3,\"b\")); b.add((1,\"a\"))\ntry: b.add((2,\"x\"))\nexcept OverflowError: pass\nelse: raise AssertionError(\"Expected capacity error\")\nassert b.advance(2)==[(1,\"a\")]\ntry: b.add((2,\"late\"))\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected late error\")\nassert b.advance(3)==[(3,\"b\")]"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "assert list(merge_lazy([iter([]),iter([(1,\"z\"),(1,\"x\")]),iter([(1,\"a\")])]))==[(1,\"z\"),(1,\"x\"),(1,\"a\")]; b=WatermarkBuffer(1); b.add((1,\"x\"))\ntry:b.add((2,\"y\"))\nexcept OverflowError:pass\nelse:raise AssertionError(\"capacity ignored\")\nassert b.advance(1)==[(1,\"x\")]; assert b.advance(2)==[]"
+      }
+    ],
+    "complexity": "Merge O(N log k), O(k) memory; buffer add/release O(log capacity) per event. Upstream streams must obey ordering/watermark contracts.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: yield results lazily from iterators.",
+        "answer": "Hold one lookahead event per stream and yield before requesting the replacement. Pull-based iteration provides backpressure naturally.",
+        "checks": [
+          "Use a generator that records every pull.",
+          "Verify tie ordering without comparing payloads."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: late events, watermarks, and bounded buffering.",
+        "answer": "A watermark is a promise that no future on-time event has timestamp <= it. Buffer by timestamp until the watermark advances, then emit safely. This lab rejects late data and full buffers explicitly. Production systems may route late events to a correction stream; bounded storage means blocking or rejecting upstream, not silently dropping arbitrary buffered events.",
+        "checks": [
+          "Advance the watermark to an event timestamp then submit that timestamp again.",
+          "Fill capacity and verify rejection preserves buffered data."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "paths",
+    "title": "Symlinks inside a sandbox",
+    "statement": "Implement secure_resolve(root,cwd,path,links)->canonical absolute path. root/cwd are canonical absolute paths; cwd must be inside root. links maps canonical absolute symlink paths to absolute or relative targets; relative targets are relative to the symlink parent. Process links as each component is traversed, including before .. . Reject any traversal above/outside root with ValueError, and symlink expansion beyond 40 hops with ValueError. Absolute paths must start with the exact root components. No real filesystem access.",
+    "starter": "def secure_resolve(root, cwd, path, links):\n    pass\n",
+    "solution": "from collections import deque\n\n\ndef secure_resolve(root, cwd, path, links):\n    \"\"\"Resolve a path inside a restricted root, expanding symbolic links.\n\n    `links` is the entire world: nothing here touches a real filesystem.\n    \"\"\"\n    base = [p for p in root.split('/') if p]\n\n    def absolute_parts(value):\n        \"\"\"Strip the root prefix, rejecting anything that is not under it.\"\"\"\n        parts = [p for p in value.split('/') if p]\n        # A sibling directory sharing a textual prefix is not inside the root.\n        if parts[:len(base)] != base:\n            raise ValueError('Outside root')\n        return parts[len(base):]\n\n    current = base + absolute_parts(cwd)\n    if path.startswith('/'):\n        # An absolute path ignores cwd entirely.\n        current = list(base)\n        pending = deque(absolute_parts(path))\n    else:\n        pending = deque(path.split('/'))\n\n    hops = 0\n    while pending:\n        part = pending.popleft()\n        if part in ('', '.'):\n            continue\n        if part == '..':\n            if len(current) == len(base):\n                raise ValueError('Outside root')\n            current.pop()\n            continue\n\n        current.append(part)\n        candidate = '/' + '/'.join(current)\n        if candidate in links:\n            hops += 1\n            if hops > 40:\n                # Without a bound, a cycle of links loops forever instead\n                # of failing.\n                raise ValueError('Symlink cycle or too many links')\n            target = links[candidate]\n            current.pop()\n            if target.startswith('/'):\n                # Checked now, so a link out of the root is rejected even if\n                # the path comes back inside later.\n                pieces = absolute_parts(target)\n                current = list(base)\n            else:\n                # A relative target is relative to the link's parent.\n                pieces = target.split('/')\n            # Pushed to the front, so the link is expanded before any later\n            # `..` is applied to where we actually end up.\n            pending.extendleft(reversed(pieces))\n\n    return '/' + '/'.join(current)\n",
+    "tests": [
+      {
+        "name": "Relative symlinks and dotdot",
+        "code": "assert secure_resolve(\"/safe\",\"/safe\",\"link/../x\",{\"/safe/link\":\"dir/sub\"})==\"/safe/dir/x\""
+      },
+      {
+        "name": "Prefix lookalike and traversal",
+        "code": "for path in [\"/safety/x\",\"../x\"]:\n    try: secure_resolve(\"/safe\",\"/safe\",path,{})\n    except ValueError: pass\n    else: raise AssertionError(\"Escape allowed\")"
+      },
+      {
+        "name": "Cycle and absolute link",
+        "code": "assert secure_resolve(\"/safe\",\"/safe\",\"x/a\",{\"/safe/x\":\"/safe/y\"})==\"/safe/y/a\"\ntry: secure_resolve(\"/safe\",\"/safe\",\"a\",{\"/safe/a\":\"b\",\"/safe/b\":\"a\"})\nexcept ValueError: pass\nelse: raise AssertionError(\"Cycle accepted\")"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "assert secure_resolve(\"/root\",\"/root\",\"link/..\",{\"/root/link\":\"dir/child\"})==\"/root/dir\"\nfor path in [\"/rooted/a\",\"../outside\"]:\n try:secure_resolve(\"/root\",\"/root\",path,{})\n except ValueError:pass\n else:raise AssertionError(\"escaped root\")"
+      }
+    ],
+    "complexity": "O(processed components), bounded by the symlink expansion cap; O(path and queued expansion) memory.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: symbolic links and cycle detection.",
+        "answer": "Resolve links before interpreting subsequent .., splice targets into the remaining components, and bound link expansion. A repeated node alone is not always a cycle when a path intentionally revisits it; a hop budget gives a clear safe termination policy.",
+        "checks": [
+          "Resolve link/../x when link targets a nested directory.",
+          "Check relative and absolute link targets plus cycles."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: enforce a sandbox root; explain why string prefix checks fail.",
+        "answer": "Containment is component-based: /safe2 is not inside /safe. Reject attempts to pop below the sandbox. This simulation is not secure real filesystem access: real code must address symlink replacement races using directory-relative OS primitives and verified handles.",
+        "checks": [
+          "Reject a path with a shared string prefix but different component.",
+          "In real integration tests race a symlink change between validation and open."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "intervals",
+    "title": "Online windows and available gaps",
+    "statement": "Implement WindowSet.add(start,end), remove(start,end), windows()->sorted disjoint merged lists, gaps(start,end)->uncovered intervals within that query. Intervals are half-open and start<end. add unions coverage; remove subtracts coverage even when only part of an earlier interval. Touching covered intervals merge. windows returns a copy.",
+    "starter": "class WindowSet:\n    pass\n",
+    "solution": "class WindowSet:\n    \"\"\"A changing set of covered, half-open time windows.\n\n    The covered set is kept sorted, disjoint and non-touching at all times.\n    That single invariant is what keeps add and remove cheap: a new interval\n    can overlap at most one existing window on each side.\n    \"\"\"\n\n    def __init__(self):\n        self.data = []\n\n    def windows(self):\n        # A copy, so the caller cannot corrupt the internal invariant.\n        return [r[:] for r in self.data]\n\n    def add(self, start, end):\n        # Union by merging the new interval into the sorted list.\n        out = []\n        for a, b in sorted(self.data + [[start, end]]):\n            # <= so that touching windows merge as well as overlapping ones.\n            if out and a <= out[-1][1]:\n                out[-1][1] = max(out[-1][1], b)\n            else:\n                out.append([a, b])\n        self.data = out\n\n    def remove(self, start, end):\n        out = []\n        for a, b in self.data:\n            if b <= start or a >= end:\n                # Entirely outside the removed range.\n                out.append([a, b])\n            else:\n                # Overlapping: keep whichever side survives, so one window\n                # can legitimately become two.\n                if a < start:\n                    out.append([a, start])\n                if b > end:\n                    out.append([end, b])\n        self.data = out\n\n    def gaps(self, start, end):\n        # Walk the covered windows once; everything not covered in between\n        # is a gap.\n        cursor = start\n        out = []\n        for a, b in self.data:\n            if b <= cursor:\n                continue\n            if a >= end:\n                break\n            if a > cursor:\n                out.append([cursor, min(a, end)])\n            cursor = max(cursor, b)\n        if cursor < end:\n            out.append([cursor, end])\n        return out\n",
+    "tests": [
+      {
+        "name": "Clipped gaps",
+        "code": "s=WindowSet(); s.add(2,4); s.add(6,9); assert s.gaps(0,7)==[[0,2],[4,6]]; assert s.gaps(3,4)==[]"
+      },
+      {
+        "name": "Removal splits coverage",
+        "code": "s=WindowSet(); s.add(0,10); s.remove(3,7); assert s.windows()==[[0,3],[7,10]]; s.add(3,7); assert s.windows()==[[0,10]]"
+      },
+      {
+        "name": "Empty, touching, copies",
+        "code": "s=WindowSet(); assert s.gaps(1,3)==[[1,3]]; s.add(1,2); s.add(2,3); a=s.windows(); a[0][0]=0; assert s.windows()==[[1,3]]; s.remove(0,9); assert s.windows()==[]"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=WindowSet(); s.add(0,10); s.remove(3,7); assert s.windows()==[[0,3],[7,10]]; w=s.windows(); w[0][0]=99; assert s.windows()==[[0,3],[7,10]]; assert s.gaps(-1,11)==[[-1,0],[3,7],[10,11]]"
+      }
+    ],
+    "complexity": "Simple sorted list: add O(n log n), remove/gaps O(n), O(n) space. Balanced interval trees improve online updates.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: return gaps within a requested range.",
+        "answer": "Walk merged coverage with a cursor starting at the query start, emit holes and clip to the requested end.",
+        "checks": [
+          "Query begins inside a covered interval.",
+          "The query ends before the next interval."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: support online insertion and deletion of windows.",
+        "answer": "Define deletion as subtracting coverage, not deleting a historical insertion record. Splits may turn one interval into two. If cancellation must undo a specific reservation instead, store IDs or coverage counts; the union alone loses provenance.",
+        "checks": [
+          "Remove the middle of one interval.",
+          "Remove a range spanning several intervals, then insert a bridge."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "peak",
+    "title": "Peak time ranges from a stream",
+    "statement": "Implement PeakTracker.add(start,end) for nonnegative-length half-open intervals and report()->(peak, ranges), with sorted positive-length ranges attaining peak. Zero-length requests are ignored. Merge touching peak ranges. Empty input returns (0,[]). add receives completed intervals in any order; report is an exact snapshot of all data received, not a prediction of future traffic.",
+    "starter": "class PeakTracker:\n    pass\n",
+    "solution": "class PeakTracker:\n    \"\"\"Reports the peak concurrency and every stretch of time it held.\n\n    The peak comes from a sweep over interval endpoints, and the ranges fall\n    out of the same walk rather than needing a second pass.\n    \"\"\"\n\n    def __init__(self):\n        # timestamp -> net change in concurrency at that instant.\n        self.changes = {}\n\n    def add(self, start, end):\n        if start == end:\n            # A zero-length interval overlaps nothing and must not be able to\n            # inflate the peak.\n            return\n        self.changes[start] = self.changes.get(start, 0) + 1\n        self.changes[end] = self.changes.get(end, 0) - 1\n\n    def report(self):\n        times = sorted(self.changes)\n        active = 0\n        peak = 0\n        ranges = []\n\n        # The last change point has no following interval, so it starts\n        # nothing.\n        for i, t in enumerate(times[:-1]):\n            active += self.changes[t]\n            end = times[i + 1]\n            if active > peak:\n                # Everything recorded against the old maximum is no longer a\n                # maximum, so start the ranges over.\n                peak = active\n                ranges = []\n            if active == peak and peak > 0:\n                if ranges and ranges[-1][1] == t:\n                    # Touching peak stretches merge into one range.\n                    ranges[-1][1] = end\n                else:\n                    ranges.append([t, end])\n\n        return peak, ranges\n",
+    "tests": [
+      {
+        "name": "Multiple peak ranges",
+        "code": "p=PeakTracker(); [p.add(*r) for r in [(0,4),(1,2),(3,5)]]; assert p.report()==(2,[[1,2],[3,4]])"
+      },
+      {
+        "name": "Touching and empty",
+        "code": "p=PeakTracker(); assert p.report()==(0,[]); p.add(1,1); p.add(0,1); p.add(1,2); assert p.report()==(1,[[0,2]])"
+      },
+      {
+        "name": "Report after updates",
+        "code": "p=PeakTracker(); p.add(0,5); assert p.report()==(1,[[0,5]]); p.add(2,3); assert p.report()==(2,[[2,3]])"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=PeakTracker(); assert s.report()==(0,[]); s.add(0,2); s.add(2,4); s.add(2,2); assert s.report()==(1,[[0,4]]); s.add(1,3); assert s.report()==(2,[[1,3]])"
+      }
+    ],
+    "complexity": "add O(1) average, report O(u log u) over unique endpoints, O(u) memory.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: return every time range attaining the peak.",
+        "answer": "Sweep aggregate changes at each timestamp and associate the resulting count with the span until the next timestamp. Reset output on a higher peak, merge touching spans at the same peak.",
+        "checks": [
+          "Equal-time starts and ends must not create a point-only peak.",
+          "Two separated ranges may share the maximum."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: estimate capacity for a streaming input.",
+        "answer": "The lab gives exact repeated snapshots for a stream of completed intervals. Live capacity requires arrival/departure events or active-request tracking, late-event policy, windowing and headroom. Historical peak is not a forecast: combine rate, service-time distributions, burst envelopes and saturation load tests.",
+        "checks": [
+          "Feed more intervals after a report and recompute.",
+          "Replay bursts and long-tail service times; observe p95 latency and queue growth."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "bfs",
+    "title": "Reconstruct a shortest route",
+    "statement": "Implement route(graph,source,target)->list of nodes on a minimum-hop directed path, [] if unreachable. Neighbors may be repeated. Traverse neighbors in lexicographic order and choose the first BFS path. source==target returns [source]. Nodes are strings; missing keys have no outgoing edges.",
+    "starter": "def route(graph, source, target):\n    pass\n",
+    "solution": "from collections import deque\n\n\ndef route(graph, source, target):\n    \"\"\"Return the nodes along a minimum-hop path, deterministically.\n\n    Breadth-first search already gives the minimum hop count, because it\n    expands in layers. The tie-break comes from expanding neighbours in\n    sorted order and marking a node as soon as it is enqueued.\n    \"\"\"\n    # Also doubles as the visited set: a node is claimed the moment it is\n    # enqueued, so a longer path cannot take it later.\n    parent = {source: None}\n    q = deque([source])\n\n    while q:\n        node = q.popleft()\n        if node == target:\n            # Walk the parent chain back toward the source, then reverse.\n            out = []\n            while node is not None:\n                out.append(node)\n                node = parent[node]\n            return out[::-1]\n        # A node missing as a key has no outgoing edges, so the lookup has to\n        # tolerate absence.\n        for nxt in sorted(set(graph.get(node, []))):\n            if nxt not in parent:\n                parent[nxt] = node\n                q.append(nxt)\n\n    return []\n",
+    "tests": [
+      {
+        "name": "Deterministic tie",
+        "code": "assert route({\"a\":[\"c\",\"b\"],\"b\":[\"d\"],\"c\":[\"d\"]},\"a\",\"d\")==[\"a\",\"b\",\"d\"]"
+      },
+      {
+        "name": "Cycles and unreachable",
+        "code": "assert route({\"a\":[\"b\",\"b\"],\"b\":[\"a\"]},\"a\",\"z\")==[]; assert route({},\"a\",\"a\")==[\"a\"]"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "assert route({\"a\":[\"c\",\"b\",\"b\"],\"b\":[\"t\"],\"c\":[\"t\"]},\"a\",\"t\")==[\"a\",\"b\",\"t\"]; assert route({},\"x\",\"x\")==[\"x\"]; assert route({},\"a\",\"b\")==[]"
+      }
+    ],
+    "complexity": "O(V+E) traversal plus sorting adjacency lists; O(V) parent/queue space.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: return an actual shortest path.",
+        "answer": "Store one parent when each node is first enqueued, then walk backward at the target. Do not store whole paths in the queue.",
+        "checks": [
+          "Two equal-length paths with reversed input neighbor order.",
+          "Cycle and source==target."
+        ],
+        "difficulty": "Easy"
+      },
+      {
+        "question": "Stage 3: weighted nonnegative latency requires Dijkstra; discuss failures during routing.",
+        "answer": "BFS minimizes edges, not latency. Use Dijkstra for nonnegative weights; the weighted-route follow-up lab provides a runnable path-reconstructing, multi-source implementation. For a changing graph use a versioned snapshot or revalidate the selected next hop, bound reroutes and prevent routing loops.",
+        "checks": [
+          "A direct edge cost 10 should lose to two edges totaling 3.",
+          "Remove a chosen edge between planning and execution and check fallback policy."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Easy"
+  },
+  {
+    "id": "trie",
+    "title": "Ranked Unicode autocomplete",
+    "statement": "Implement RankedAutocomplete.add(word,count=1), delete(word)->bool and suggest(prefix,k)->list of normalized words. Normalize with NFC then casefold then NFC; equivalent forms accumulate frequency. count is positive. Suggestions sort by descending frequency then lexicographic normalized word; delete removes the entire word and its frequency. k<=0 returns [].",
+    "starter": "class RankedAutocomplete:\n    pass\n",
+    "solution": "import unicodedata\n\n\nclass RankedAutocomplete:\n    \"\"\"Autocomplete that ranks by frequency and unifies equivalent spellings.\n\n    Everything is stored in its normalised form, so two spellings of the same\n    word are indistinguishable by the time they reach the dict.\n    \"\"\"\n\n    def __init__(self):\n        self.counts = {}\n\n    def _norm(self, s):\n        # NFC, then casefold, then NFC again. The trailing NFC is not\n        # decoration: casefolding can decompose a character, and without\n        # re-normalising the same word would land under two different keys.\n        return unicodedata.normalize('NFC', unicodedata.normalize('NFC', s).casefold())\n\n    def add(self, word, count=1):\n        word = self._norm(word)\n        self.counts[word] = self.counts.get(word, 0) + count\n\n    def delete(self, word):\n        word = self._norm(word)\n        if word not in self.counts:\n            return False\n        del self.counts[word]\n        return True\n\n    def suggest(self, prefix, k):\n        if k <= 0:\n            return []\n        prefix = self._norm(prefix)\n        # Descending frequency, then ascending word, so a tie never depends\n        # on insertion order.\n        return sorted(\n            (w for w in self.counts if w.startswith(prefix)),\n            key=lambda w: (-self.counts[w], w),\n        )[:k]\n",
+    "tests": [
+      {
+        "name": "Ranking and deletion",
+        "code": "a=RankedAutocomplete(); a.add(\"cat\",2); a.add(\"car\",2); a.add(\"cab\",3); assert a.suggest(\"ca\",3)==[\"cab\",\"car\",\"cat\"]; assert a.delete(\"CAB\"); assert not a.delete(\"cab\"); assert a.suggest(\"ca\",1)==[\"car\"]"
+      },
+      {
+        "name": "Normalization",
+        "code": "a=RankedAutocomplete(); a.add(\"CAFÉ\"); a.add(\"café\"); a.add(\"cafeteria\"); assert a.suggest(\"CAFÉ\",3)==[\"café\"]; assert a.suggest(\"caf\",2)==[\"café\",\"cafeteria\"]; assert a.suggest(\"\",0)==[]"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "a=RankedAutocomplete(); a.add(\"Straße\",2); a.add(\"STRASSE\",3); a.add(\"street\",4); assert a.suggest(\"str\",10)==[\"strasse\",\"street\"]; assert a.delete(\"STRASSE\"); assert not a.delete(\"straße\"); assert a.suggest(\"\",5)==[\"street\"]"
+      }
+    ],
+    "complexity": "Reference scans O(n) words then sorts matching words O(r log r). For repeated low-latency queries cache top-k at trie nodes with update invalidation.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: rank by frequency with deterministic ties.",
+        "answer": "Frequency changes invalidate cached rankings. The simple reference favors correctness; a trie can enumerate only the prefix subtree, or maintain top-k summaries per node.",
+        "checks": [
+          "Equal counts resolve lexicographically.",
+          "Increment an existing word until it becomes the top suggestion."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: delete words and handle Unicode normalization.",
+        "answer": "Normalize identically on add/delete/query. NFC handles canonically equivalent characters; casefold is stronger than lowercase. Delete should remove terminal metadata and prune empty trie branches if using a trie. This policy is not locale-specific collation.",
+        "checks": [
+          "Use composed and decomposed accented forms.",
+          "Delete a prefix word while preserving its longer extensions."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "dp",
+    "title": "Trie-based token reconstruction",
+    "statement": "Implement token_plan(text,costs)->(minimum_cost,tokens). Segment text into nonempty known tokens; nonnegative integer costs, reuse allowed. Impossible returns (-1,[]), empty returns (0,[]). Tie-break by the lexicographically smallest full token list. Use a trie to discover candidate tokens. Return exact strings, not token positions.",
+    "starter": "def token_plan(text, costs):\n    pass\n",
+    "solution": "def token_plan(text, costs):\n    \"\"\"Return the cheapest segmentation, breaking ties on the token list.\n\n    The cost pass keeps only numbers. Carrying token lists alongside them and\n    comparing them at every position is quadratic, so the list is rebuilt in a\n    second, linear pass.\n    \"\"\"\n    # A trie, so candidate tokens at each position are found by walking rather\n    # than by trying every known token.\n    root = {}\n    for word, cost in costs.items():\n        node = root\n        for ch in word:\n            node = node.setdefault(ch, {})\n        node[None] = (word, cost)\n\n    n = len(text)\n    # best[i] is the cheapest way to segment text[i:].\n    best = [None] * (n + 1)\n    best[n] = (0, [])\n\n    for i in range(n - 1, -1, -1):\n        node = root\n        for j in range(i, n):\n            if text[j] not in node:\n                break\n            node = node[text[j]]\n            if None in node and best[j + 1] is not None:\n                word, cost = node[None]\n                suffix, plan = best[j + 1]\n                candidate = (cost + suffix, [word] + plan)\n                if best[i] is None or candidate < best[i]:\n                    best[i] = candidate\n\n    # Empty text costs 0 with no tokens; an unsegmentable text costs -1.\n    return best[0] if best[0] is not None else (-1, [])\n",
+    "tests": [
+      {
+        "name": "Reconstruction and greedy trap",
+        "code": "assert token_plan(\"abcd\",{\"abc\":1,\"ab\":3,\"cd\":2,\"d\":9})==(5,[\"ab\",\"cd\"])"
+      },
+      {
+        "name": "Tie, impossible, empty",
+        "code": "assert token_plan(\"aa\",{\"a\":1,\"aa\":2})==(2,[\"a\",\"a\"]); assert token_plan(\"z\",{})==(-1,[]); assert token_plan(\"\",{})==(0,[])"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "assert token_plan(\"aaaa\",{\"a\":0,\"aa\":0})==(0,[\"a\",\"a\",\"a\",\"a\"]); assert token_plan(\"\",{})==(0,[]); assert token_plan(\"x\",{})==(-1,[])"
+      }
+    ],
+    "complexity": "Trie matching O(nL) plus token-list construction/comparison; worst-case O(n²L) time and O(n²) plan storage. Parent pointers reduce storage but tie comparisons still need care.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: reconstruct the chosen tokens.",
+        "answer": "Store the chosen suffix plan along with cost; compare full token lists when costs tie. Parent pointers are a memory improvement once correctness is established.",
+        "checks": [
+          "Two equal-cost segmentations with different first tokens.",
+          "Impossible suffix after an otherwise valid token."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: optimize dictionary lookup with a trie.",
+        "answer": "Walking a trie from each position stops on the first missing edge, avoiding testing every dictionary word. The reference includes this optimization; it does not claim linear total time because reconstruction and tie-breaking copy lists.",
+        "checks": [
+          "Many dictionary entries with unrelated prefixes.",
+          "Long runs with many equal-cost segmentations expose plan-copying costs."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "backtrack",
+    "title": "Minimize worker makespan",
+    "statement": "Implement balance_jobs(jobs,workers)->(makespan,assignment), where assignment[i] is the worker index for original job i. jobs contains positive integers; workers>=1 or raise ValueError. Minimize maximum sum assigned to any worker; any optimal assignment is accepted. Empty jobs returns (0,[]). At most 12 jobs and 6 workers; do not mutate jobs.",
+    "starter": "def balance_jobs(jobs, workers):\n    pass\n",
+    "solution": "def balance_jobs(jobs, workers):\n    \"\"\"Split jobs between workers so the busiest worker is as light as possible.\n\n    The greedy split is usually right but not always, so the search confirms\n    it and the answer is proved optimal rather than assumed.\n    \"\"\"\n    if workers < 1:\n        raise ValueError('Positive workers required')\n    if not jobs:\n        return 0, []\n\n    # Commit the heaviest job first: it is the one most likely to constrain\n    # the result, so deciding it early prunes hardest.\n    order = sorted(range(len(jobs)), key=lambda i: -jobs[i])\n    loads = [0] * workers\n    assignment = [0] * len(jobs)\n    best = sum(jobs) + 1\n    best_assignment = []\n\n    def search(pos):\n        nonlocal best, best_assignment\n        if pos == len(order):\n            # The objective is the maximum load, not the total or average.\n            best = max(loads)\n            best_assignment = assignment[:]\n            return\n        i = order[pos]\n        seen = set()\n        for w, load in enumerate(loads):\n            if load in seen:\n                # Two workers with the same load lead to identical subtrees.\n                continue\n            if load + jobs[i] >= best:\n                # This branch already exceeds the best makespan found, and\n                # loads only grow.\n                continue\n            seen.add(load)\n            loads[w] += jobs[i]\n            assignment[i] = w\n            search(pos + 1)\n            loads[w] -= jobs[i]\n\n    search(0)\n    return best, best_assignment\n",
+    "tests": [
+      {
+        "name": "Optimal assignment",
+        "code": "jobs=[8,7,6,5,4]; m,a=balance_jobs(jobs,2); assert m==15; loads=[0,0]\nfor size,w in zip(jobs,a): loads[w]+=size\nassert len(a)==len(jobs) and max(loads)==m; assert jobs==[8,7,6,5,4]"
+      },
+      {
+        "name": "Empty and extra workers",
+        "code": "assert balance_jobs([],2)==(0,[]); m,a=balance_jobs([3,1],4); assert m==3; assert len(a)==2"
+      },
+      {
+        "name": "Invalid workers",
+        "code": "try: balance_jobs([1],0)\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "jobs=[4,3,3,2]; score,assignment=balance_jobs(jobs,2); assert score==6; assert len(assignment)==4; assert all(0<=w<2 for w in assignment); assert max(sum(j for j,w in zip(jobs,assignment) if w==k) for k in range(2))==score; assert jobs==[4,3,3,2]"
+      }
+    ],
+    "complexity": "Worst-case O(workers^jobs) search; O(jobs+workers) working memory excluding recursion snapshots.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: return the assignment and minimize the largest load.",
+        "answer": "Sort by largest job but retain original indices. Branch over worker choices, skip equivalent loads, and prune branches that cannot beat the best makespan. Record assignments at optimal leaves.",
+        "checks": [
+          "Recompute loads from the returned assignment.",
+          "Check a case where naive greedy scheduling is suboptimal."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: compare heuristics with exact search at large scale.",
+        "answer": "For large instances use longest-processing-time-first: assign each descending job to the least loaded worker via a heap. Compare its makespan to lower bounds max(max job, total/workers), and to the exact solver on small samples. Good runtime does not make a heuristic exact.",
+        "checks": [
+          "Measure the optimality gap on small adversarial jobs.",
+          "Compare throughput for thousands of jobs with the exact search limit."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "dedupe",
+    "title": "Bounded deduplication window",
+    "statement": "Implement EventTotals(retention). accept(id,account,amount,now)->bool, total(account)->int. First accepted ID wins until now>=first_time+retention, then the same ID may be accepted again. Rejected duplicates do not refresh expiration. Timestamps are nondecreasing; retention>0. Expiration only removes dedupe records, never prior totals. Also live_ids(now)->number of retained IDs for memory checks.",
+    "starter": "class EventTotals:\n    pass\n",
+    "solution": "from collections import deque\n\n\nclass EventTotals:\n    \"\"\"Idempotent aggregation with a bounded deduplication window.\n\n    Two structures that age differently on purpose: the account totals are\n    never pruned, while the record of which ids have been seen expires.\n    \"\"\"\n\n    def __init__(self, retention):\n        self.retention = retention\n        self.ids = set()\n        # (expiry time, id), so the left edge is the next to go.\n        self.queue = deque()\n        self.totals = {}\n\n    def _expire(self, now):\n        while self.queue and self.queue[0][0] <= now:\n            _, id = self.queue.popleft()\n            self.ids.remove(id)\n\n    def accept(self, id, account, amount, now):\n        self._expire(now)\n        if id in self.ids:\n            # A duplicate is refused outright, and deliberately does not\n            # refresh the expiration: a client retrying in a loop would\n            # otherwise hold its own id alive forever.\n            return False\n        self.ids.add(id)\n        self.queue.append((now + self.retention, id))\n        self.totals[account] = self.totals.get(account, 0) + amount\n        return True\n\n    def total(self, account):\n        return self.totals.get(account, 0)\n\n    def live_ids(self, now):\n        self._expire(now)\n        return len(self.ids)\n",
+    "tests": [
+      {
+        "name": "Retention is not refreshed",
+        "code": "e=EventTotals(10); assert e.accept(\"x\",\"a\",2,0); assert not e.accept(\"x\",\"b\",9,9); assert e.accept(\"x\",\"a\",3,10); assert e.total(\"a\")==5; assert e.total(\"b\")==0"
+      },
+      {
+        "name": "Reclamation preserves totals",
+        "code": "e=EventTotals(1); [e.accept(str(i),\"a\",1,0) for i in range(100)]; assert e.live_ids(1)==0; assert e.total(\"a\")==100"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=EventTotals(5); assert s.accept(\"x\",\"a\",3,0); assert not s.accept(\"x\",\"b\",9,4); assert s.accept(\"x\",\"b\",2,5); assert s.total(\"a\")==3 and s.total(\"b\")==2; assert s.live_ids(10)==0; assert s.total(\"a\")==3"
+      }
+    ],
+    "complexity": "Amortized O(1) accept; space O(events within retention + accounts). A time bound is not a fixed memory bound under unbounded traffic.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: streaming updates and bounded deduplication retention.",
+        "answer": "Store accepted IDs with expiry in arrival order, then remove expired IDs from both the queue and set. This intentionally permits duplicates outside the retention window; document that semantic limitation.",
+        "checks": [
+          "A duplicate just before expiry must not move the expiry.",
+          "Totals remain after dedupe records are removed."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: crash between recording the ID and updating the total; design an atomic write.",
+        "answer": "In durable storage, atomically insert a unique event ID and update the aggregate in one transaction. On uniqueness conflict do not charge again. For cross-system effects use an outbox plus idempotent consumer, not two unrelated writes. Retention must cover the source retry/replay horizon.",
+        "checks": [
+          "Crash after each individual step, replay, and assert one aggregate update.",
+          "Replay an event older than retention and verify the documented reconciliation policy."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "window",
+    "title": "Streaming distinct-event window",
+    "statement": "Implement longest_span(events,k)->(start,end) for the longest contiguous span containing <=k distinct strings; end exclusive, ties choose smallest start. k<=0 or empty returns (0,0). Also implement TimeWindow(window).add(kind,now) and counts(now)->dict of kinds in (now-window,now]. Timestamps across all operations are nondecreasing; window>0; repeated timestamps count separately. counts returns a copy.",
+    "starter": "def longest_span(events, k):\n    pass\n\nclass TimeWindow:\n    pass\n",
+    "solution": "from collections import deque\n\n\ndef longest_span(events, k):\n    \"\"\"The longest contiguous span holding at most k distinct values.\"\"\"\n    if k <= 0:\n        return 0, 0\n    counts = {}\n    left = 0\n    best = (0, 0)\n    for right, kind in enumerate(events):\n        counts[kind] = counts.get(kind, 0) + 1\n        # Shrink until the window is valid again. A kind dropping to zero\n        # leaves the window entirely, which can make it valid and longer\n        # without the right edge moving.\n        while len(counts) > k:\n            old = events[left]\n            counts[old] -= 1\n            if not counts[old]:\n                del counts[old]\n            left += 1\n        # Strictly greater, so a tie keeps the smaller start.\n        if right + 1 - left > best[1] - best[0]:\n            best = (left, right + 1)\n    return best\n\n\nclass TimeWindow:\n    \"\"\"Running counts over a half-open time window.\"\"\"\n\n    def __init__(self, window):\n        self.window = window\n        self.events = deque()\n        self.totals = {}\n\n    def _expire(self, now):\n        # Half-open: an event at now - window has fallen out.\n        while self.events and self.events[0][0] <= now - self.window:\n            _, kind = self.events.popleft()\n            self.totals[kind] -= 1\n            if not self.totals[kind]:\n                del self.totals[kind]\n\n    def add(self, kind, now):\n        self._expire(now)\n        self.events.append((now, kind))\n        self.totals[kind] = self.totals.get(kind, 0) + 1\n\n    def counts(self, now):\n        self._expire(now)\n        # A copy, so the caller cannot corrupt the counts.\n        return dict(self.totals)\n",
+    "tests": [
+      {
+        "name": "Earliest longest span",
+        "code": "assert longest_span([\"a\",\"b\",\"c\",\"b\",\"a\"],2)==(1,4); assert longest_span([\"a\",\"b\",\"c\"],2)==(0,2); assert longest_span([],2)==(0,0)"
+      },
+      {
+        "name": "Time boundaries and copies",
+        "code": "w=TimeWindow(5); w.add(\"a\",0); w.add(\"b\",1); w.add(\"b\",1); assert w.counts(5)=={\"b\":2}; d=w.counts(5); d[\"b\"]=99; assert w.counts(6)=={}"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "assert longest_span([\"a\",\"b\",\"c\",\"c\"],1)==(2,4); assert longest_span([\"a\",\"b\"],1)==(0,1); s=TimeWindow(2); s.add(\"a\",0); s.add(\"a\",0); s.add(\"b\",1); assert s.counts(2)=={\"b\":1}; copy=s.counts(2); copy[\"b\"]=99; assert s.counts(2)=={\"b\":1}"
+      }
+    ],
+    "complexity": "Span O(n) time, O(k) counts; stream amortized O(1) add, counts O(distinct output), memory proportional to live events.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: return indices with earliest-start tie breaking.",
+        "answer": "Update the best interval only for a strictly longer candidate to preserve earliest-start ties. Return exclusive end indices so length is end-start.",
+        "checks": [
+          "Equal longest windows at different positions.",
+          "k=0 and empty input."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: adapt to a timestamp window on an unbounded stream.",
+        "answer": "A duration window is bounded in time, not in event count. Expire timestamps <=now-window, update counts, and remove zero counts. For out-of-order arrivals use watermark buffering; this deque assumes nondecreasing time.",
+        "checks": [
+          "Exact lower-bound expiration and repeated timestamps.",
+          "A huge burst tests memory even when the window is short."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "parser",
+    "title": "Validated incremental decoder",
+    "statement": "Implement SafeDecoder(max_frame).feed(chunk)->new complete ASCII payloads and finish()->None. Length headers contain decimal digits only, no leading zeros except 0, followed by colon. Reject non-ASCII input, malformed headers, or length>max_frame with ValueError as soon as decidable. finish rejects incomplete headers/payloads. After any error the decoder remains failed and all further calls raise ValueError. Retain parsing state across chunks and avoid repeated concatenation of partial bodies. max_frame is nonnegative.",
+    "starter": "class SafeDecoder:\n    pass\n",
+    "solution": "class SafeDecoder:\n    \"\"\"Decodes length-prefixed frames from an arbitrarily chunked stream.\n\n    A frame is `<decimal length>:<that many bytes>`. Once the stream has been\n    declared invalid the decoder stays failed, because a caller feeding a\n    broken stream must not be able to make it start working again.\n    \"\"\"\n\n    def __init__(self, max_frame):\n        self.limit = max_frame\n        self.header = ''\n        self.remaining = None\n        self.parts = []\n        self.failed = False\n\n    def _fail(self):\n        # Set the flag before raising, so later calls see it.\n        self.failed = True\n        raise ValueError('Invalid frame stream')\n\n    def feed(self, chunk):\n        if self.failed:\n            self._fail()\n        if not chunk.isascii():\n            self._fail()\n\n        out = []\n        i = 0\n        while i < len(chunk):\n            if self.remaining is None:\n                # Reading a header. Each character is checked as it arrives so\n                # a bad frame is rejected the moment it is decidable.\n                c = chunk[i]\n                i += 1\n                if c == ':':\n                    if not self.header:\n                        self._fail()\n                    self.remaining = int(self.header)\n                    self.header = ''\n                    if self.remaining == 0:\n                        out.append('')\n                        self.remaining = None\n                elif '0' <= c <= '9':\n                    if self.header == '0':\n                        # Leading zeros are not allowed.\n                        self._fail()\n                    self.header += c\n                    # Reject as soon as the length is known to be too large,\n                    # rather than buffering a body we will never accept.\n                    if (\n                        len(self.header) > len(str(self.limit))\n                        or int(self.header) > self.limit\n                    ):\n                        self._fail()\n                else:\n                    self._fail()\n            else:\n                # Reading a body. Appended in slices, so a large payload is\n                # never re-concatenated on every call.\n                take = min(self.remaining, len(chunk) - i)\n                self.parts.append(chunk[i:i + take])\n                i += take\n                self.remaining -= take\n                if self.remaining == 0:\n                    out.append(''.join(self.parts))\n                    self.parts = []\n                    self.remaining = None\n        return out\n\n    def finish(self):\n        # A partial header or body means a frame that can never complete.\n        if self.failed or self.header or self.remaining is not None:\n            self._fail()\n",
+    "tests": [
+      {
+        "name": "Fragmented body and empty frame",
+        "code": "d=SafeDecoder(10); out=[]\nfor c in \"5:hello0:3:a:b\": out+=d.feed(c)\nassert out==[\"hello\",\"\",\"a:b\"]; assert d.finish() is None"
+      },
+      {
+        "name": "Malformed and oversized",
+        "code": "for data in [\"01:x\",\"-1:x\",\":\",\"11:\",\"1:é\"]:\n    d=SafeDecoder(10)\n    try: d.feed(data)\n    except ValueError: pass\n    else: raise AssertionError(data)\n    try: d.feed(\"0:\")\n    except ValueError: pass\n    else: raise AssertionError(\"Failure not sticky\")"
+      },
+      {
+        "name": "Truncated stream and long fragmented frame",
+        "code": "d=SafeDecoder(3); d.feed(\"3:ab\")\ntry: d.finish()\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected truncated error\")\nd=SafeDecoder(5000); d.feed(\"5000:\"); result=[]\nfor _ in range(5000): result+=d.feed(\"x\")\nassert result==[\"x\"*5000]"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "d=SafeDecoder(3); assert d.feed(\"0:3:a:\")==[\"\"]; assert d.feed(\"b\")==[\"a:b\"]; d.finish()\nfor bad in [\"01:\",\"4:\",\"é\"]:\n d=SafeDecoder(3)\n try:d.feed(bad)\n except ValueError:pass\n else:raise AssertionError(\"bad frame accepted\")\n try:d.feed(\"0:\")\n except ValueError:pass\n else:raise AssertionError(\"failed decoder reused\")"
+      }
+    ],
+    "complexity": "Payload processing O(N) with one final join per frame; header parsing bounded by log(max_frame) digits. Memory O(max_frame + returned output).",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: reject malformed or oversized frames.",
+        "answer": "Validate header syntax and maximum length incrementally; finish distinguishes a valid empty stream from a truncated message. A sticky failure state avoids silently resynchronizing in a corrupted stream.",
+        "checks": [
+          "Split a malformed header across calls.",
+          "Reject a frame length before receiving its body."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: avoid quadratic copying with byte buffers and an explicit parsing cursor.",
+        "answer": "Collect payload fragments and join once at completion. Never repeatedly concatenate the entire growing body. A bytearray and offset parser is an alternative, provided consumed prefixes are compacted infrequently.",
+        "checks": [
+          "Feed a large body one byte at a time.",
+          "Compare doubling input sizes to expose quadratic copying; timing itself is not asserted in the functional tests."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "debug",
+    "title": "Deadline-aware retries",
+    "statement": "Implement retry_deadline(operation,attempts,base_delay,deadline,clock,sleep,jitter). Retry only TimeoutError; all other errors propagate. attempts>=1 or ValueError. Before each attempt require clock()<deadline or raise TimeoutError(\"deadline\"). After failure number i (zero-based), sleep max(0, base_delay*2**i + jitter(i)); if clock()+delay>=deadline raise TimeoutError(\"deadline\") without sleeping. Last retryable failure re-raises original error. A successful call returns even if it completes after the deadline (no preemption). Injected clock/sleep are deterministic; no real sleeping. jitter returns an additive offset.",
+    "starter": "def retry_deadline(operation, attempts, base_delay, deadline, clock, sleep, jitter):\n    pass\n",
+    "solution": "def retry_deadline(operation, attempts, base_delay, deadline, clock, sleep, jitter):\n    \"\"\"Retry with exponential backoff under a hard deadline.\n\n    The clock, the sleep and the jitter are all injected, so nothing here\n    really waits and the behaviour is fully deterministic in tests.\n    \"\"\"\n    if attempts < 1:\n        raise ValueError('Positive attempts required')\n\n    for i in range(attempts):\n        # Checked before each attempt, not during one: the deadline bounds\n        # waiting, and there is no safe way to interrupt a call in flight.\n        if clock() >= deadline:\n            raise TimeoutError('deadline')\n        try:\n            # Returning the result directly is deliberate. None, 0, False and\n            # the empty string are all successful answers, so the result's\n            # truthiness must never decide whether this succeeded.\n            return operation()\n        except TimeoutError:\n            if i == attempts - 1:\n                # The last retryable failure re-raises the real error, so the\n                # caller can see why it kept failing.\n                raise\n            delay = max(0, base_delay * 2 ** i + jitter(i))\n            if clock() + delay >= deadline:\n                # The wait could not help, so fail now rather than pause.\n                raise TimeoutError('deadline')\n            sleep(delay)\n",
+    "tests": [
+      {
+        "name": "Backoff and falsey result",
+        "code": "t=[0]; waits=[]; calls=[]\ndef sleep(d): waits.append(d); t[0]+=d\ndef op():\n    calls.append(1)\n    if len(calls)<3: raise TimeoutError(\"again\")\n    return 0\nassert retry_deadline(op,3,1,10,lambda:t[0],sleep,lambda i:0.5)==0; assert waits==[1.5,2.5]"
+      },
+      {
+        "name": "Deadline prevents sleep and retry",
+        "code": "calls=[]; waits=[]\ndef op(): calls.append(1); raise TimeoutError(\"again\")\ntry: retry_deadline(op,5,2,2,lambda:0,waits.append,lambda i:0)\nexcept TimeoutError as e: assert str(e)==\"deadline\"\nelse: raise AssertionError(\"Expected deadline\")\nassert len(calls)==1 and waits==[]"
+      },
+      {
+        "name": "Original error and no retries for ValueError",
+        "code": "def op(): raise TimeoutError(\"original\")\ntry: retry_deadline(op,1,1,10,lambda:0,lambda d:None,lambda i:0)\nexcept TimeoutError as e: assert str(e)==\"original\"\nelse: raise AssertionError(\"Expected error\")\ndef bad(): raise ValueError(\"bad\")\ntry: retry_deadline(bad,3,1,10,lambda:0,lambda d:None,lambda i:0)\nexcept ValueError: pass\nelse: raise AssertionError(\"Unexpected retry\")"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "now=[0]; sleeps=[]\ndef clock():return now[0]\ndef sleep(d):sleeps.append(d); now[0]+=d\ndef fail():raise TimeoutError(\"original\")\ntry:retry_deadline(fail,5,2,2,clock,sleep,lambda i:0)\nexcept TimeoutError as e:assert str(e)==\"deadline\"\nelse:raise AssertionError(\"deadline ignored\")\nassert sleeps==[]; assert retry_deadline(lambda:False,1,1,2,clock,sleep,lambda i:0) is False"
+      }
+    ],
+    "complexity": "O(attempts) calls, O(1) state; deadlines bound starting new attempts, not duration of an uninterruptible operation.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: injected sleep, exponential backoff, jitter, and a deadline.",
+        "answer": "Inject time and random jitter so tests are deterministic. Count total attempts carefully. A synchronous wrapper cannot interrupt a hung call: set transport timeouts or use cancellable async operations for a real deadline.",
+        "checks": [
+          "No new attempt at the exact deadline.",
+          "No sleep after the last allowed attempt."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: when is retrying a write unsafe? Add idempotency.",
+        "answer": "A timeout can mean a write succeeded but its reply was lost. Reuse one idempotency key across every retry; the server stores key, request fingerprint, status and result atomically with the side effect. Reject reuse with a different payload and keep records for the whole retry horizon.",
+        "checks": [
+          "Commit the write, lose the response, retry the same key and return the original result.",
+          "Send a different payload under that key and reject it."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "async",
+    "title": "Bounded streaming worker pool",
+    "statement": "Implement async pool_map(items,fn,limit,timeout=None)->ordered list, where items is a synchronous iterable and fn is async. Use at most limit worker tasks and no per-item tasks when timeout=None. Pull a new item only when a worker is ready; do not pre-materialize items. timeout, if given, applies to each fn call. Reject limit<1. On error or caller cancellation cancel AND await all worker work. Return [] for no input. Output storage may grow with n; this is bounded work-in-flight, not bounded total output.",
+    "starter": "async def pool_map(items, fn, limit, timeout=None):\n    pass\n",
+    "solution": "import asyncio\n\n\nasync def pool_map(items, fn, limit, timeout=None):\n    \"\"\"Apply an async function over a sync iterable with a fixed worker pool.\n\n    A small pool of long-lived workers pulling from a shared iterator, rather\n    than one task per item, is the whole point: the input is never\n    materialised and the number of tasks never grows with its length.\n    \"\"\"\n    if limit < 1:\n        raise ValueError('Positive limit required')\n\n    iterator = iter(items)\n    results = []\n\n    async def worker():\n        while True:\n            try:\n                item = next(iterator)\n            except StopIteration:\n                return\n            # The result slot is claimed before awaiting, which is what keeps\n            # the output in input order rather than completion order.\n            index = len(results)\n            results.append(None)\n            if timeout is None:\n                results[index] = await fn(item)\n            else:\n                results[index] = await asyncio.wait_for(fn(item), timeout)\n\n    tasks = [asyncio.create_task(worker()) for _ in range(limit)]\n    try:\n        await asyncio.gather(*tasks)\n        return results\n    except BaseException:\n        # gather does not stop the others when one raises, so cancel them and\n        # then await them. Cancelling without awaiting would leave work\n        # running after this call has returned.\n        for task in tasks:\n            task.cancel()\n        await asyncio.gather(*tasks, return_exceptions=True)\n        raise\n",
+    "tests": [
+      {
+        "name": "Ordering, bounded tasks, lazy pulls",
+        "code": "import asyncio\nactive=0; peak=0; pulled=0; finished=0; task_ids=set()\ndef source():\n    global pulled\n    for i in range(8):\n        pulled+=1\n        assert pulled-finished<=2\n        yield i\nasync def fn(i):\n    global active,peak,finished\n    task_ids.add(id(asyncio.current_task())); active+=1; peak=max(peak,active)\n    await asyncio.sleep(0.001)\n    active-=1; finished+=1; return i*2\nassert await pool_map(source(),fn,2)==list(range(0,16,2)); assert peak==2 and len(task_ids)<=2"
+      },
+      {
+        "name": "Timeout awaits cleanup",
+        "code": "import asyncio\nactive=0\nasync def fn(i):\n    global active\n    active+=1\n    try: await asyncio.sleep(1)\n    finally: active-=1\ntry: await pool_map([1,2],fn,2,timeout=0.001)\nexcept TimeoutError: pass\nelse: raise AssertionError(\"Expected timeout\")\nassert active==0"
+      },
+      {
+        "name": "Caller cancellation and invalid limit",
+        "code": "import asyncio\nactive=0\nasync def fn(i):\n    global active\n    active+=1\n    try: await asyncio.sleep(1)\n    finally: active-=1\nt=asyncio.create_task(pool_map(range(10),fn,2)); await asyncio.sleep(0.001); t.cancel()\ntry: await t\nexcept asyncio.CancelledError: pass\nelse: raise AssertionError(\"Cancellation swallowed\")\nassert active==0\ntry: await pool_map([],fn,0)\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "import asyncio\nasync def f(x):await asyncio.sleep(0); return x+1\nassert await pool_map(iter(range(20)),f,2)==list(range(1,21)); assert await pool_map(iter([]),f,2)==[]\ntry:await pool_map([1],f,0)\nexcept ValueError:pass\nelse:raise AssertionError(\"invalid limit accepted\")"
+      }
+    ],
+    "complexity": "O(limit) workers/in-flight work, O(n) ordered output, pull-based backpressure. Per-item timeout may create a bounded additional task per active worker.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: use a fixed worker pool so task count is O(limit).",
+        "answer": "A fixed number of workers pull from one iterator. Assign output indices before the await; this is atomic within a single event loop turn. Await all worker termination before returning or raising.",
+        "checks": [
+          "Track unique current_task IDs in fn.",
+          "Assert no more than limit items have been pulled but not finished."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: streaming backpressure, per-item timeout, and caller cancellation.",
+        "answer": "The iterable is pulled only as capacity opens, so upstream synchronous production is bounded by concurrency. Timeout cancels the individual call and cleanup propagates across workers. A truly unbounded output stream needs an async iterator with bounded reorder buffering, or completion-order delivery; the returned list here intentionally retains results.",
+        "checks": [
+          "A timed-out fn must execute its finally block.",
+          "Cancel the outer caller and verify no worker remains active."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Explain why asyncio does not make CPU-bound work parallel.",
+        "answer": "asyncio multiplexes cooperative tasks on one thread. CPU-bound Python without await blocks all tasks and timers. Use processes or native code that releases the GIL outside this browser lab; limit I/O concurrency with async and keep CPU work elsewhere.",
+        "checks": [
+          "Compare sleep-based I/O tasks with a tight CPU loop.",
+          "Measure event-loop delay; do not assume more coroutines create parallel CPU execution."
+        ],
+        "difficulty": "Easy"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "credits",
+    "title": "Retroactive credit history",
+    "statement": "Implement HistoricalLedger.grant(id,amount,time,ttl), spend(id,amount,time), balance(query_time), accepted(spend_id,query_time)->bool or None. IDs are globally unique, amounts nonnegative, ttl positive. Events can arrive out of order; replay ordered by event time, then grant before spend, then lexicographic ID. At each event expire grants with expiry<=time. Spend earliest expiry then grant ID; insufficient spend consumes nothing. accepted returns None if that spend has not happened by query_time or is unknown. Retroactive insertion may change a prior spend outcome; queries use all currently recorded events.",
+    "starter": "class HistoricalLedger:\n    pass\n",
+    "solution": "import heapq\n\n\nclass HistoricalLedger:\n    \"\"\"A credit ledger that can answer questions about the past.\n\n    Events arrive out of order and can even arrive long after the moment they\n    describe, so a running total cannot be patched. Every query replays the\n    events in their canonical order instead.\n    \"\"\"\n\n    def __init__(self):\n        self.events = []\n\n    def grant(self, id, amount, time, ttl):\n        # kind 0: grants sort before spends at the same instant, so a grant\n        # made at time t is available to a spend made at time t.\n        self.events.append((time, 0, id, amount, ttl))\n\n    def spend(self, id, amount, time):\n        self.events.append((time, 1, id, amount, None))\n\n    def _replay(self, query):\n        heap = []\n        total = 0\n        outcomes = {}\n\n        for time, kind, id, amount, ttl in sorted(self.events):\n            if time > query:\n                break\n            # Expire before this event, so a grant that has already lapsed\n            # cannot be spent.\n            while heap and heap[0][0] <= time:\n                _, _, old = heapq.heappop(heap)\n                total -= old\n\n            if kind == 0:\n                if amount:\n                    heapq.heappush(heap, (time + ttl, id, amount))\n                    total += amount\n            else:\n                outcomes[id] = amount <= total\n                if amount > total:\n                    # Refused: consume nothing at all.\n                    continue\n                total -= amount\n                # Spend the earliest expiring grants first, lowest id first\n                # among those expiring together, leaving partial grants.\n                while amount:\n                    expiry, gid, available = heapq.heappop(heap)\n                    used = min(amount, available)\n                    amount -= used\n                    if available > used:\n                        heapq.heappush(heap, (expiry, gid, available - used))\n\n        # Grants that outlive the last event still expire before the query.\n        while heap and heap[0][0] <= query:\n            _, _, old = heapq.heappop(heap)\n            total -= old\n\n        return total, outcomes\n\n    def balance(self, query_time):\n        return self._replay(query_time)[0]\n\n    def accepted(self, spend_id, query_time):\n        # None when the spend had not happened by then, or is unknown.\n        return self._replay(query_time)[1].get(spend_id)\n",
+    "tests": [
+      {
+        "name": "Retroactive outcome changes",
+        "code": "l=HistoricalLedger(); l.spend(\"s\",4,5); assert l.accepted(\"s\",5) is False; l.grant(\"g\",5,0,10); assert l.accepted(\"s\",5) is True; assert l.balance(5)==1; assert l.balance(4)==5; assert l.accepted(\"s\",4) is None"
+      },
+      {
+        "name": "Earliest expiry and exact boundary",
+        "code": "l=HistoricalLedger(); l.grant(\"a\",5,0,10); l.grant(\"b\",4,1,2); l.spend(\"s\",3,2); assert l.balance(3)==5; assert l.balance(10)==0"
+      },
+      {
+        "name": "Same-time grants precede spends",
+        "code": "l=HistoricalLedger(); l.spend(\"s\",3,2); l.grant(\"g\",3,2,1); assert l.accepted(\"s\",2) is True; assert l.balance(2)==0"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=HistoricalLedger(); s.spend(\"s\",4,2); assert s.accepted(\"s\",2) is False; s.grant(\"g\",5,0,10); assert s.accepted(\"s\",1) is None; assert s.accepted(\"s\",2) is True; assert s.balance(2)==1; assert s.balance(10)==0"
+      }
+    ],
+    "complexity": "Append O(1), each replay O(n log n + heap work) time and O(n) space. Checkpoints and invalidation accelerate historical queries.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: accept retroactive events and historical queries.",
+        "answer": "An immutable event list plus deterministic replay gives a simple correct baseline. Retroactive insertion invalidates snapshots at or after that event time. If spend decisions must never change after acknowledgment, reject retroactive changes or use compensating events instead of this lab policy.",
+        "checks": [
+          "Query before and after inserting an earlier grant.",
+          "Check same-timestamp ordering and exact expiry."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: refunds linked to grants, durable audit log, concurrent spending.",
+        "answer": "Track each spend allocation to grant IDs so a refund restores the right lifetime; an expired original grant does not silently become fresh credit. Persist grant/spend/refund events with unique IDs in an append-only ledger. Serialize spending or atomically compare-and-update a version to prevent double spending; use reconciliation against materialized balances.",
+        "checks": [
+          "Refund a partially consumed grant after its expiration.",
+          "Race two spends that individually fit but together exceed funds.",
+          "Replay the durable ledger and match the derived balance."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "topk",
+    "title": "Windowed top errors and heavy hitters",
+    "statement": "Implement WindowErrors(window).add(error,now), top(k,now)->strings by frequency descending then lexical ascending within (now-window,now]. Global timestamps nondecreasing. Also implement HeavyHitters(capacity).add(error), candidates()->copy of Misra–Gries counters: increment an existing key; insert at 1 if fewer than capacity keys; otherwise decrement all counters and remove zeros, without inserting this event. capacity>=1. Candidate counts are lower bounds, not exact frequencies.",
+    "starter": "class WindowErrors:\n    pass\n\nclass HeavyHitters:\n    pass\n",
+    "solution": "from collections import Counter, deque\n\n\nclass WindowErrors:\n    \"\"\"Exact top-k errors over a rolling time window.\"\"\"\n\n    def __init__(self, window):\n        self.window = window\n        # Arrival order, so the left edge can be dropped as time advances.\n        self.events = deque()\n        self.counts = Counter()\n\n    def _expire(self, now):\n        # The window is half-open: an event at now - window has fallen out.\n        while self.events and self.events[0][0] <= now - self.window:\n            _, error = self.events.popleft()\n            self.counts[error] -= 1\n            if self.counts[error] == 0:\n                del self.counts[error]\n\n    def add(self, error, now):\n        self._expire(now)\n        self.events.append((now, error))\n        self.counts[error] += 1\n\n    def top(self, k, now):\n        self._expire(now)\n        # Descending frequency, then ascending lexicographic, so the same data\n        # always produces the same output.\n        return sorted(self.counts, key=lambda e: (-self.counts[e], e))[:max(0, k)]\n\n\nclass HeavyHitters:\n    \"\"\"A bounded-memory heavy-hitter sketch (Misra-Gries).\n\n    Counts are lower bounds on the true frequency. They are never exact and\n    never an overestimate, which is the trade for holding at most `capacity`\n    counters regardless of how many distinct errors arrive.\n    \"\"\"\n\n    def __init__(self, capacity):\n        self.capacity = capacity\n        self.counts = {}\n\n    def add(self, error):\n        if error in self.counts:\n            self.counts[error] += 1\n        elif len(self.counts) < self.capacity:\n            # Room for a new candidate.\n            self.counts[error] = 1\n        else:\n            # Full. Decrement everyone and insert nothing, which is what\n            # keeps a genuine heavy hitter above zero while rare items fall\n            # out. Iterating a list copy allows deleting as we go.\n            for key in list(self.counts):\n                self.counts[key] -= 1\n                if not self.counts[key]:\n                    del self.counts[key]\n\n    def candidates(self):\n        return dict(self.counts)\n",
+    "tests": [
+      {
+        "name": "Window frequency and expiry",
+        "code": "w=WindowErrors(5); w.add(\"b\",0); w.add(\"b\",1); w.add(\"a\",1); assert w.top(2,1)==[\"b\",\"a\"]; assert w.top(2,5)==[\"a\",\"b\"]; assert w.top(2,6)==[]"
+      },
+      {
+        "name": "Misra-Gries exact transitions",
+        "code": "h=HeavyHitters(2); [h.add(x) for x in [\"a\",\"b\",\"c\"]]; assert h.candidates()=={}; [h.add(x) for x in [\"a\",\"a\",\"b\",\"c\"]]; assert h.candidates()=={\"a\":1}"
+      },
+      {
+        "name": "Bounded state and frequent item",
+        "code": "h=HeavyHitters(3)\nfor x in [\"hot\"]*100+[str(i) for i in range(40)]:\n    h.add(x); assert len(h.candidates())<=3\nassert \"hot\" in h.candidates()"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=WindowErrors(5); s.add(\"z\",0); s.add(\"a\",0); s.add(\"z\",1); assert s.top(9,1)==[\"z\",\"a\"]; assert s.top(9,5)==[\"z\"]; assert s.top(9,6)==[]; h=HeavyHitters(1); h.add(\"a\"); h.add(\"b\"); assert h.candidates()=={}; h.add(\"c\"); c=h.candidates(); c.clear(); assert h.candidates()=={\"c\":1}"
+      }
+    ],
+    "complexity": "Window add amortized O(1), top O(u log u), memory O(live events). Misra–Gries add O(capacity) worst case and O(capacity) counters.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: top errors within the last five minutes.",
+        "answer": "Expire old samples from both a deque and frequency table, then select top k with deterministic ties. For last five minutes use window=300 when timestamps are seconds.",
+        "checks": [
+          "A formerly dominant error expires and changes the ranking.",
+          "Equal counts sort lexicographically."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: approximate heavy hitters under a strict memory limit.",
+        "answer": "Misra–Gries with m counters retains every item with frequency > N/(m+1), but does not guarantee an exact top-k list. Counters underestimate. If the data can be replayed, make a second pass for exact counts of the candidate set; otherwise report the approximation and error bounds.",
+        "checks": [
+          "Assert at most m keys after every event.",
+          "Construct a frequent item above the threshold and verify it survives."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "search",
+    "title": "Boolean and phrase retrieval",
+    "statement": "Implement QueryIndex.add(doc_id,text), all_of(query), any_of(query), without(query), phrase(query). Return sorted integer IDs. Tokens are lower().split() with punctuation kept. all_of requires all tokens; any_of requires any; without excludes documents containing any query token; phrase requires exact consecutive tokens, including repeated words. Empty all_of/any_of/phrase returns []; empty without returns all IDs. Replacing a document removes old content.",
+    "starter": "class QueryIndex:\n    pass\n",
+    "solution": "class QueryIndex:\n    \"\"\"A document index answering boolean and phrase queries.\"\"\"\n\n    def __init__(self):\n        self.docs = {}\n\n    def add(self, doc_id, text):\n        # lower().split() keeps punctuation, which documents and queries both\n        # still contain. Splitting on word characters would drop symbols and\n        # the two tokenisations would stop agreeing.\n        # Re-adding a document replaces its content rather than merging.\n        self.docs[doc_id] = text.lower().split()\n\n    def all_of(self, query):\n        terms = set(query.lower().split())\n        return sorted(i for i, t in self.docs.items() if terms and terms <= set(t))\n\n    def any_of(self, query):\n        terms = set(query.lower().split())\n        return sorted(i for i, t in self.docs.items() if terms & set(t))\n\n    def without(self, query):\n        terms = set(query.lower().split())\n        # An empty query excludes nothing, so every document comes back.\n        return sorted(i for i, t in self.docs.items() if not terms & set(t))\n\n    def phrase(self, query):\n        q = query.lower().split()\n        if not q:\n            return []\n        # A phrase needs consecutive positions, not merely the presence of\n        # every word. A set intersection would wrongly accept a document that\n        # holds the tokens a thousand lines apart.\n        return sorted(\n            i\n            for i, t in self.docs.items()\n            if any(t[j:j + len(q)] == q for j in range(len(t) - len(q) + 1))\n        )\n",
+    "tests": [
+      {
+        "name": "AND OR NOT",
+        "code": "s=QueryIndex(); s.add(1,\"red blue\"); s.add(2,\"red green\"); s.add(3,\"yellow\"); assert s.all_of(\"red blue\")==[1]; assert s.any_of(\"green yellow\")==[2,3]; assert s.without(\"red\")==[3]; assert s.without(\"\")==[1,2,3]"
+      },
+      {
+        "name": "Positions and repeated tokens",
+        "code": "s=QueryIndex(); s.add(1,\"a b a\"); s.add(2,\"a a b\"); assert s.phrase(\"a a\")==[2]; assert s.phrase(\"b a\")==[1]; assert s.phrase(\"\")==[]"
+      },
+      {
+        "name": "Replacement and case",
+        "code": "s=QueryIndex(); s.add(1,\"OLD\"); s.add(1,\"NEW\"); assert s.any_of(\"old\")==[]; assert s.phrase(\"new\")==[1]"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=QueryIndex(); s.add(2,\"a a b\"); s.add(1,\"a b\"); assert s.phrase(\"a a\")==[2]; assert s.without(\"\")==[1,2]; s.add(2,\"\"); assert s.phrase(\"a a\")==[]; assert s.any_of(\"a\")==[1]; assert s.without(\"a\")==[2]"
+      }
+    ],
+    "complexity": "Scan reference O(total tokens) for Boolean operations plus sorting; phrase O(total tokens × query length) worst case. Positional inverted indexes accelerate retrieval.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: OR, NOT, and phrase queries with token positions.",
+        "answer": "The reference stores token sequences, so adjacency and repeated tokens remain available. For a positional index, intersect document postings first, then test whether positions for each query token differ by the expected offsets. NOT needs an explicit document universe, including documents with no tokens.",
+        "checks": [
+          "Distinguish a b a from a a b.",
+          "Replace a document and ensure old terms disappear."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: shard the index, update asynchronously, and enforce access controls.",
+        "answer": "Choose document sharding for parallel local query evaluation and merge results; term sharding complicates distributed intersections. Version documents so asynchronous index updates cannot overwrite newer content. Enforce tenant/ACL filters at retrieval and recheck before serving snippets; cache keys include permissions or invalidation version.",
+        "checks": [
+          "Revoke access while a cached search result exists.",
+          "Deliver indexing version 2 before version 1 and preserve version 2.",
+          "Delete a document while one shard is stale."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "weighted",
+    "title": "Multi-source route reconstruction",
+    "statement": "Implement best_route(graph,sources,target)->(cost,path). graph maps string nodes to (neighbor,weight) lists. Choose lowest cost from any source; ties choose lexicographically smallest entire path. Weights must be strictly positive; reject any weight<=0 anywhere in graph with ValueError, even in disconnected components. This stricter follow-up contract makes lexicographic tie-breaking unambiguous without zero-cost cycles. sources may contain duplicates; empty/unreachable returns (-1,[]). A target source returns (0,[target]).",
+    "starter": "def best_route(graph, sources, target):\n    pass\n",
+    "solution": "import heapq\n\n\ndef best_route(graph, sources, target):\n    \"\"\"Lowest-cost route from any source, with a total tie-break on the path.\n\n    The path itself is part of the priority queue key, so the queue always\n    expands the smaller route first and the tie-break falls out of the search\n    rather than needing a separate comparison pass.\n    \"\"\"\n    # Validated across the whole graph, not just the component we traverse:\n    # a zero-weight edge is exactly what would make the tie-break ambiguous.\n    if any(w <= 0 for edges in graph.values() for _, w in edges):\n        raise ValueError('Positive weights required')\n\n    # Every source starts at cost zero with a one-node path. Duplicates are\n    # harmless because the dict collapses them.\n    best = {s: (0, (s,)) for s in sources}\n    heap = [(0, (s,), s) for s in best]\n    heapq.heapify(heap)\n\n    while heap:\n        cost, path, node = heapq.heappop(heap)\n        # Stale entry: this node was settled better after we pushed this.\n        if best[node] != (cost, path):\n            continue\n        if node == target:\n            return cost, list(path)\n        for nxt, weight in graph.get(node, []):\n            candidate = (cost + weight, path + (nxt,))\n            # Comparing the whole tuple is what applies the lexicographic\n            # tie-break on the complete path.\n            if nxt not in best or candidate < best[nxt]:\n                best[nxt] = candidate\n                heapq.heappush(heap, (*candidate, nxt))\n\n    return -1, []\n",
+    "tests": [
+      {
+        "name": "Best source and indirect route",
+        "code": "assert best_route({\"a\":[(\"t\",10)],\"b\":[(\"c\",1)],\"c\":[(\"t\",2)]},[\"a\",\"b\"],\"t\")== (3,[\"b\",\"c\",\"t\"])"
+      },
+      {
+        "name": "Lexical ties and target source",
+        "code": "assert best_route({\"a\":[(\"c\",1),(\"b\",1)],\"b\":[(\"t\",1)],\"c\":[(\"t\",1)]},[\"a\"],\"t\")== (2,[\"a\",\"b\",\"t\"]); assert best_route({},[\"t\"],\"t\")== (0,[\"t\"]); assert best_route({},[],\"t\")==(-1,[])"
+      },
+      {
+        "name": "Reject unsupported weights",
+        "code": "for w in [0,-1]:\n    try: best_route({\"x\":[(\"y\",w)]},[\"t\"],\"t\")\n    except ValueError: pass\n    else: raise AssertionError(\"Weight not rejected\")"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "assert best_route({\"s\":[(\"b\",1),(\"a\",1)],\"a\":[(\"t\",1)],\"b\":[(\"t\",1)]},[\"s\",\"s\"],\"t\")== (2,[\"s\",\"a\",\"t\"])\ntry:best_route({\"unused\":[(\"x\",0)]},[\"t\"],\"t\")\nexcept ValueError:pass\nelse:raise AssertionError(\"invalid disconnected edge accepted\")"
+      }
+    ],
+    "complexity": "Dijkstra heap operations plus O(path length) tuple copying/comparison per relaxation; O(VE) worst-case path-copy storage in dense worst cases. Parent pointers reduce memory when full-path lexical ties are not required.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: reconstruct the route; handle multiple source regions.",
+        "answer": "Initialize all sources at zero cost, keep predecessor/path metadata with each best distance, and use a deterministic tie policy. A virtual source is an equivalent model. The lab explicitly restricts weights to positive values to simplify full-path tie handling.",
+        "checks": [
+          "Two sources compete for a target.",
+          "Equal-cost paths differ only in an intermediate node."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: explain why negative edges invalidate this algorithm.",
+        "answer": "With negative edges, a node removed from the priority queue may later become cheaper. Early return is then invalid: a→target=2, a→b=5, b→target=-10 has true cost -5. Bellman–Ford can handle negatives and detect reachable negative cycles. The base nonnegative Dijkstra works with zero edges; this follow-up rejects zero only for its tie policy.",
+        "checks": [
+          "Run the three-edge negative counterexample against an early-return Dijkstra.",
+          "Distinguish a negative cycle that can reach the target from an irrelevant disconnected one."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "rle",
+    "title": "Resumable filtered iterator",
+    "statement": "Implement ResumableRLE(runs,allowed=None) over (nonnegative count, nonnegative value) runs. allowed is None or a collection of permitted values. next(n) consumes n permitted values and returns the last, or -1 after exhausting the rest; n>=1. Do not expand or loop over individual values. snapshot()->(run_index,offset) identifies position in the original runs; restore(snapshot) restores that position for the SAME runs and filter (snapshots are valid and opaque to callers). Filtered-out runs may be skipped lazily.",
+    "starter": "class ResumableRLE:\n    pass\n",
+    "solution": "class ResumableRLE:\n    \"\"\"A filtered, resumable run-length iterator.\n\n    Runs are never expanded into individual values, so work stays\n    proportional to the runs crossed rather than to the counts they encode.\n    \"\"\"\n\n    def __init__(self, runs, allowed=None):\n        # Copied, so a snapshot still means the same thing after the caller\n        # mutates the list it passed in.\n        self.runs = tuple(runs)\n        self.allowed = None if allowed is None else set(allowed)\n        self.i = 0\n        self.offset = 0\n\n    def snapshot(self):\n        # A position in the original run list, not in the emitted stream.\n        # With a filter in play those are different things, and only this one\n        # can be restored.\n        return self.i, self.offset\n\n    def restore(self, snapshot):\n        self.i, self.offset = snapshot\n\n    def next(self, n):\n        while self.i < len(self.runs):\n            count, value = self.runs[self.i]\n            if self.allowed is not None and value not in self.allowed:\n                # A run is permitted or not as a whole, so filtering never\n                # splits one. Skipped in O(1).\n                self.i += 1\n                self.offset = 0\n                continue\n            remaining = count - self.offset\n            if remaining >= n:\n                self.offset += n\n                return value\n            # The request spans into the next run, so consume what is left\n            # here and keep going.\n            n -= remaining\n            self.i += 1\n            self.offset = 0\n        return -1\n",
+    "tests": [
+      {
+        "name": "Snapshot replay",
+        "code": "r=ResumableRLE([(3,8),(2,5)]); assert r.next(2)==8; s=r.snapshot(); assert r.next(2)==5; r.restore(s); assert r.next(2)==5; assert s==(0,2)"
+      },
+      {
+        "name": "Filter huge runs",
+        "code": "r=ResumableRLE([(10**12,9),(10**12,7)],allowed={7}); assert r.next(10**12)==7; assert r.next(1)==-1"
+      },
+      {
+        "name": "Empty and exhaustion restore",
+        "code": "r=ResumableRLE([(0,1),(2,2)]); s=r.snapshot(); assert r.next(3)==-1; end=r.snapshot(); r.restore(s); assert r.next(2)==2; r.restore(end); assert r.next(1)==-1"
+      },
+      {
+        "name": "Additional boundary and state regressions",
+        "code": "s=ResumableRLE([(0,7),(10**12,2),(3,9)],allowed={2}); assert s.next(10**12-1)==2; snap=s.snapshot(); assert s.next(1)==2; assert s.next(1)==-1; s.restore(snap); assert s.next(1)==2; assert s.next(1)==-1"
+      }
+    ],
+    "complexity": "O(runs crossed) per next, independent of expanded counts; O(1) snapshot; O(runs + filter) storage.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: snapshot and restore iterator position.",
+        "answer": "Store position separately from immutable runs instead of mutating counts. Snapshots are constant-size position tokens. Durable tokens should also include source version and filter identity so incompatible restore attempts are rejected.",
+        "checks": [
+          "Snapshot halfway through a run, advance, restore and replay.",
+          "Restore exhaustion and verify it remains exhausted."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "Stage 3: compose filters/merges over resumable iterators without materialization.",
+        "answer": "Filtering can skip whole runs when the predicate depends only on the value. The lab preserves the original run cursor and never materializes expanded values. A merged resumable iterator must snapshot every child cursor plus any buffered lookahead, tie-break state and filter version.",
+        "checks": [
+          "Filter a trillion-value run in one step.",
+          "For a merge, snapshot after fetching lookahead and verify restoring does not skip that buffered item."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Medium"
+  },
+  {
+    "id": "nodes",
+    "title": "Phase-numbered cluster gossip",
+    "statement": "Implement gossip(node_ids, adjacency, phases)->dict. Each node stamps every id it hears with the phase it first heard it in, starting at phase 0 for its own id. In phase k, every node sends the ids it stamped with phase k-1 to each neighbour and takes delivery of whatever arrives, keeping the first stamp it ever saw for an id. adjacency is undirected and an id outside node_ids is ignored. Return {\"counts\", \"converged\", \"sent\"}: counts per node, whether every count equals that node's true component size, and the total number of ids transmitted across links. phases of 0 sends nothing and leaves every node knowing only itself.",
+    "starter": "def gossip(node_ids, adjacency, phases):\n    pass\n",
+    "solution": "def gossip(node_ids, adjacency, phases):\n    \"\"\"Coordinated gossip: forward only what you learned in the previous phase.\n\n    Full-set gossip is correct and pays for it on every round. Stamping each id\n    with the phase it was learned in turns the payload into the delta, so a\n    settled id crosses a link once and never again.\n    \"\"\"\n    wired = neighbours(node_ids, adjacency)\n    truth = component_sizes(node_ids, adjacency)\n    # learned[node][id] = the phase in which that node first heard of id. The\n    # stamp is the whole protocol: it says both what to send and when.\n    learned = {node_id: {node_id: 0} for node_id in node_ids}\n    sent = 0\n\n    for phase in range(1, phases + 1):\n        # Sends are cut from the state at the start of the phase, so nothing\n        # learned during this phase can be forwarded within it.\n        deltas = {\n            node_id: {nid for nid, at in state.items() if at == phase - 1}\n            for node_id, state in learned.items()\n        }\n        for source in node_ids:\n            delta = deltas[source]\n            for target in wired[source]:\n                sent += len(delta)\n                for nid in delta:\n                    # Stamp on first hearing only, so the delta a node emits\n                    # later is the set of ids it did not already have.\n                    learned[target].setdefault(nid, phase)\n\n    counts = {node_id: len(learned[node_id]) for node_id in node_ids}\n    converged = all(counts[node_id] == truth.get(node_id) for node_id in node_ids)\n    return {\"counts\": counts, \"converged\": converged, \"sent\": sent}\n\n\ndef neighbours(node_ids, adjacency):\n    \"\"\"Undirected neighbours per node; ids outside the cluster are ignored.\"\"\"\n    live = set(node_ids)\n    links = {node_id: set() for node_id in node_ids}\n    for node_id, adjacent in adjacency.items():\n        if node_id not in live:\n            continue\n        for other in adjacent:\n            if other in live:\n                links[node_id].add(other)\n                links[other].add(node_id)\n    return links\n\n\ndef component_sizes(node_ids, adjacency):\n    \"\"\"Ground truth: the true size of the component each node belongs to.\"\"\"\n    links = neighbours(node_ids, adjacency)\n    sizes = {}\n    for start in node_ids:\n        if start in sizes:\n            continue\n        seen = {start}\n        stack = [start]\n        while stack:\n            for other in links[stack.pop()]:\n                if other not in seen:\n                    seen.add(other)\n                    stack.append(other)\n        for node_id in seen:\n            sizes[node_id] = len(seen)\n    return sizes\n",
+    "tests": [
+      {
+        "name": "One phase per hop, then the far end agrees",
+        "code": "ids = [\"a\", \"b\", \"c\", \"d\"]\nadj = {\"a\": [\"b\"], \"b\": [\"a\", \"c\"], \"c\": [\"b\", \"d\"], \"d\": [\"c\"]}\nout = gossip(ids, adj, 3)\nassert out[\"counts\"] == {\"a\": 4, \"b\": 4, \"c\": 4, \"d\": 4}\nassert out[\"converged\"]\nearly = gossip(ids, adj, 2)\nassert early[\"counts\"] == {\"a\": 3, \"b\": 4, \"c\": 4, \"d\": 3}\nassert early[\"converged\"] is False"
+      },
+      {
+        "name": "Deltas cut the ids that cross a link",
+        "code": "ids = [\"n1\", \"n2\", \"n3\", \"n4\", \"n5\", \"n6\"]\nadj = {\"n1\": [\"n2\"], \"n2\": [\"n3\"], \"n3\": [\"n4\"], \"n4\": [\"n5\"], \"n5\": [\"n6\"]}\nout = gossip(ids, adj, 5)\nassert out[\"counts\"] == {n: 6 for n in ids} and out[\"converged\"]\nassert out[\"sent\"] == 58\nfull = 2 * (len(ids) - 1) * 5 * len(ids)\nassert out[\"sent\"] * 4 < full"
+      },
+      {
+        "name": "Components size themselves and strangers are ignored",
+        "code": "ids = [\"a\", \"b\", \"x\", \"y\"]\nadj = {\"a\": [\"b\"], \"x\": [\"y\"], \"z\": [\"a\"]}\nout = gossip(ids, adj, 3)\nassert out[\"counts\"] == {\"a\": 2, \"b\": 2, \"x\": 2, \"y\": 2}\nassert out[\"converged\"]\nassert 4 not in out[\"counts\"].values()"
+      },
+      {
+        "name": "Lone node, clique and no phases at all",
+        "code": "solo = gossip([\"solo\"], {}, 3)\nassert solo[\"counts\"] == {\"solo\": 1} and solo[\"converged\"]\nassert solo[\"sent\"] == 0\nzero = gossip([\"a\", \"b\"], {\"a\": [\"b\"], \"b\": [\"a\"]}, 0)\nassert zero[\"counts\"] == {\"a\": 1, \"b\": 1}\nassert zero[\"converged\"] is False and zero[\"sent\"] == 0\nids = [\"a\", \"b\", \"c\", \"d\"]\nclique = {a: [b for b in ids if b != a] for a in ids}\nwide = gossip(ids, clique, 2)\nassert wide[\"counts\"] == {a: 4 for a in ids} and wide[\"converged\"]"
+      }
+    ],
+    "complexity": "O(links) messages per phase and each carries only the previous phase's delta, so the ids transmitted over a whole run are O(V x links) rather than the O(phases x V x links) full-set gossip pays. A component of diameter d needs d phases to settle, and every node holds O(V) stamps.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: replace full-set gossip with a phase-numbered protocol that forwards only the ids learned in the previous phase.",
+        "answer": "Stamp every id with the phase a node first heard it in, and in phase k forward only the ids stamped k-1. On a six-node path with five phases the full vector puts 10 links x 5 phases x 6 ids = 300 ids on the wire, and the delta protocol puts 58 there, so about 5x less traffic for the same round count. I accept two costs: a dict of stamps per node instead of a bare set, and the fact that a dropped delta costs a whole phase of latency because nothing else will forward that id. I would revisit the delta-only choice once measured loss passes about 10% per round, because at that point an id can stall indefinitely and full-set gossip is what keeps converging anyway.",
+        "checks": [
+          "Six-node path, five phases: compare ids sent against the full-vector cost.",
+          "Four-node path, two phases: the ends must still be short, not silently equal."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: derive the bytes-per-round cost of a membership vector at cluster scale, and say the figure at which it stops being affordable.",
+        "answer": "I will assume 1,000 nodes, average degree 3, and 8 bytes per node id on the wire, and that membership changes are infrequent enough that a count runs once every 30 seconds. Average degree 3 gives 1,000 x 3 = 3,000 directed links, so one round ships 3,000 x 8 KB = 24 MB, and gossip on a random graph of that degree settles in about log2(1,000) = 10 rounds, so a single count costs 240 MB of cluster-wide traffic. That is the number that ends the argument: 24 MB per round is not metadata any more. The fix is to send deltas instead of vectors, or to move membership into a grow-only set with per-node dots and run anti-entropy periodically rather than continuously. The signal that would send me back to this is bytes on the wire per membership change crossing the cost of one authoritative recount.",
+        "checks": [
+          "Link count x payload size x rounds for 1,000 nodes, with each figure labelled.",
+          "Say which assumption you would measure first, and how you would measure it."
+        ],
+        "difficulty": "Medium"
+      },
+      {
+        "question": "How would you tell a split brain partition apart from a slow network in production?",
+        "answer": "I would not try to tell them apart from the network, because the network is the thing under suspicion. A slow network still has a majority on one side of it; a split brain has two sides that each believe they hold it. So I would put the decision on a quorum: every member holds a lease with a monotonic expiry granted by a majority, and any member that cannot renew stops serving writes and steps down to read-only until it has re-leased. The observable signal is not latency but two members claiming the same term at once, so the term number is what I would alert on, and a member that sees a higher term steps down immediately rather than waiting for its lease to lapse. I would move reads off the leader first so quorum only guards writes, and I would revisit when quorum shows up as write latency, at which point the first thing to split is the lease by operation type rather than dropping it.",
+        "checks": [
+          "Partitioned cluster: both sides accept writes for the same term.",
+          "A member whose lease expired must stop serving writes before the network recovers."
+        ],
+        "difficulty": "Medium"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "resumable",
+    "title": "Bounded replay window",
+    "statement": "Implement ReplayLog(window) over an append-only log of items. append(item) records one item. next(n), n>=1, consumes the next n items and returns the last, or -1 once the rest is consumed. snapshot() is an int position in the whole log. restore(token) moves the cursor there and raises ValueError if that item has already fallen out of the window. replay(token) returns the list of items from token to the end of the log without moving the cursor, and raises ValueError on the same condition as restore. spilled() reports how many items have fallen out of memory. Only the last window items are kept, so a token below spilled() cannot be honoured; window>=1.",
+    "starter": "class ReplayLog:\n    def __init__(self, window):\n        pass\n\n    def append(self, item):\n        pass\n\n    def spilled(self):\n        pass\n\n    def snapshot(self):\n        pass\n\n    def restore(self, token):\n        pass\n\n    def next(self, n):\n        pass\n\n    def replay(self, token):\n        pass\n",
+    "solution": "class ReplayLog:\n    \"\"\"An append-only log whose recent tail can be replayed without a source.\n\n    Replay replaces re-running the source: the last few items stay in\n    memory, so restoring a recent position costs nothing. Everything older has\n    fallen out, and that is the price of the bound.\n    \"\"\"\n\n    def __init__(self, window):\n        self.window = window\n        self.held = []\n        self.cursor = 0\n        self.total = 0\n\n    def spilled(self):\n        # Memory only holds the tail, so this is how much history is gone.\n        return max(0, self.total - self.window)\n\n    def append(self, item):\n        self.held.append(item)\n        self.total += 1\n        while len(self.held) > self.window:\n            # The oldest item leaves memory but stays counted in total, which\n            # is what keeps a position meaningful as an index into the log.\n            self.held.pop(0)\n\n    def snapshot(self):\n        return self.cursor\n\n    def _check(self, token):\n        if token < self.spilled():\n            # The item at this position no longer exists anywhere. Failing\n            # loudly beats silently resuming from the wrong place.\n            raise ValueError('position has been spilled')\n\n    def restore(self, token):\n        self._check(token)\n        self.cursor = token\n\n    def next(self, n):\n        last = None\n        for _ in range(n):\n            index = self.cursor - self.spilled()\n            if index < 0 or index >= len(self.held):\n                return -1\n            last = self.held[index]\n            self.cursor += 1\n        return last\n\n    def replay(self, token):\n        # A tee: it reads what follows a position without moving the cursor.\n        self._check(token)\n        return list(self.held[token - self.spilled():])\n",
+    "tests": [
+      {
+        "name": "Restore inside the window replays",
+        "code": "l = ReplayLog(5)\nfor i in range(5):\n    l.append(i)\nassert l.spilled() == 0\nassert l.next(5) == 4\nfor i in range(5, 8):\n    l.append(i)\nassert l.spilled() == 3\ntoken = l.snapshot()\nassert token == 5\nassert l.next(2) == 6\nassert l.replay(token) == [5, 6, 7]\nl.restore(token)\nassert l.next(2) == 6\nassert l.next(1) == 7\nassert l.next(1) == -1"
+      },
+      {
+        "name": "A spilled token is refused",
+        "code": "l = ReplayLog(3)\nfor i in range(3):\n    l.append(i)\nassert l.next(1) == 0\ntoken = l.snapshot()\nassert token == 1\nfor i in range(3, 6):\n    l.append(i)\nassert l.spilled() == 3\ntry:\n    l.restore(token)\n    assert False\nexcept ValueError:\n    pass\ntry:\n    l.replay(token)\n    assert False\nexcept ValueError:\n    pass\nl.restore(3)\nassert l.next(3) == 5\nassert l.next(1) == -1"
+      },
+      {
+        "name": "Replay reads without moving the cursor",
+        "code": "l = ReplayLog(4)\nfor i in range(4):\n    l.append(i)\nassert l.next(1) == 0\ntoken = l.snapshot()\nassert l.replay(token) == [1, 2, 3]\nassert l.snapshot() == token\nassert l.replay(0) == [0, 1, 2, 3]\nassert l.next(3) == 3\nassert l.replay(token) == [1, 2, 3]\nassert l.replay(4) == []\nassert l.next(1) == -1"
+      },
+      {
+        "name": "Empty log, single slot and a long stream",
+        "code": "e = ReplayLog(1)\nassert e.spilled() == 0\nassert e.snapshot() == 0\nassert e.next(1) == -1\nassert e.replay(0) == []\ne.append(\"a\")\nassert e.next(1) == \"a\"\nassert e.next(1) == -1\nassert e.spilled() == 0\ne.append(\"b\")\nassert e.spilled() == 1\nassert e.replay(1) == [\"b\"]\nassert e.next(1) == \"b\"\ntry:\n    e.restore(0)\n    assert False\nexcept ValueError:\n    pass\nbig = ReplayLog(3)\nfor i in range(1000):\n    big.append(i)\n    big.next(1)\nassert big.spilled() == 997\nassert big.snapshot() == 1000\nassert big.next(1) == -1\nbig.restore(997)\nassert big.next(3) == 999\nassert big.next(1) == -1"
+      }
+    ],
+    "complexity": "O(1) per append once the window is full, O(window) worst case per next, O(1) snapshot and restore, O(window) for replay, and O(window) memory held. Falling further behind than the window is unrecoverable, which is the trade for the bound.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: keep a bounded window of consumed items so restore does not re-run the source, and spill the rest.",
+        "answer": "I would keep the tail in memory and treat everything older as gone rather than on disk, because a spill target is a separate durability problem from a cursor. Two structures age differently: a ring of the last N items, and a count of everything ever appended, so a position stays an integer index and never needs the item it points at. The invariant I would write down is that the cursor must never fall more than N behind the tail; below that, reading returns -1 rather than a wrong item, and restore raises instead of guessing. I would size the window from the replay horizon the consumer actually needs: at 1,000 records/s and a 60s checkpoint interval, 60,000 items is the figure, so N is whatever the consumer stalls for. The signal to revisit it is restore raising in production, which means the window is too small or a consumer stalled.",
+        "checks": [
+          "Snapshot in the middle of the window, append past the window, then restore and confirm the token is still honoured.",
+          "Let the reader fall window+1 items behind and confirm the head is refused rather than silently skipped."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: replay an append-only log from a checkpoint across reordered segments, and prove the replayed stream matches the original.",
+        "answer": "I would give every record a sequence number assigned once when the record is written, rather than per segment, so the reader can reorder whole segments without renumbering anything. The replay is then: read the checkpoint, drop any record whose sequence is at or below the one the checkpoint folded in, sort what remains by sequence, and re-apply. Dropping the ones at or below is what makes the replay idempotent. To prove the replayed stream matches I would not eyeball it: hash the emitted stream on the first run, hash it again on the replay, and require the two to be equal, with the sequence of every mismatch printed. Duplicates and gaps deserve separate checks, because deduplication hides a gap. The tradeoff is the memory a reorder buffer costs, and I would revisit it at a segment size where that buffer stopped fitting comfortably.",
+        "checks": [
+          "Replay a log whose segments arrive out of order and confirm the hash matches the original run.",
+          "Replay a log with a duplicated segment and a missing one and confirm the duplicate is dropped and the gap is detected."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "A long job is killed mid-stream and restarted. What do you persist, and what do you lose?",
+        "answer": "I would persist the position and the identity of the source, not the output, because the output is only worth something once the whole stream is behind it. Two things make a position safe to persist: the source identity has to be checked on restart, or a restored position points into a different log, and the last effect needs a boundary marker so a half-applied unit is redone rather than skipped. I would accept losing whatever fell out of the window, and say so, because the alternative is unbounded memory for a job whose whole point is being long. I would also keep the log, not just the cursor: a job that dies twice with the same cursor is a bug, and the log is what you read to find out why.",
+        "checks": [
+          "Kill the job mid-stream, restart from the persisted position, and confirm no item is processed twice and none is skipped.",
+          "Restore a position taken against a different source and confirm it is rejected rather than silently accepted."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "persist",
+    "title": "Checksummed journal frames",
+    "statement": "CheckedJournal(codec=None) keeps the base codec and checksums every record. append(key, value, now) and remove(key, now) each write one framed line into self.log. Every record carries a seq the journal assigns, increasing by one and never reused. load(now) replays with the last write winning and a tombstone deleting, and raises ValueError on a bad checksum or a line with no newline. snapshot(now) returns {seq, now, data}; restore(snapshot, now) starts from data and replays only the records with a greater seq. compact(snapshot, now) replaces the log with one state line plus the framed records past snapshot['seq'], and returns load(now).",
+    "starter": "import json\nimport zlib\n\nCURRENT_VERSION = 2\nMIGRATIONS = {}\n\n\nclass RecordCodec:\n    def __init__(self, version=None):\n        pass\n\n    def encode(self, state):\n        pass\n\n    def decode(self, text):\n        pass\n\n\ndef _crc(text):\n    pass\n\n\nclass CheckedJournal:\n    def __init__(self, codec=None):\n        pass\n\n    def frame(self, record):\n        pass\n\n    def append(self, key, value, now):\n        pass\n\n    def remove(self, key, now):\n        pass\n\n    def load(self, now):\n        pass\n\n    def snapshot(self, now):\n        pass\n\n    def restore(self, snapshot, now):\n        pass\n\n    def compact(self, snapshot, now):\n        pass\n",
+    "solution": "import json\nimport zlib\n\nCURRENT_VERSION = 2\n\n\ndef _from_v1(payload):\n    if 'data' not in payload:\n        raise ValueError('v1 payload has no data')\n    return payload['data']\n\n\nMIGRATIONS = {1: _from_v1}\n\n\nclass RecordCodec:\n    \"\"\"The base record format, unchanged. A log written by either version\n    still reads, and framing below wraps whichever version it is.\"\"\"\n\n    CURRENT = CURRENT_VERSION\n\n    def __init__(self, version=None):\n        self.version = self.CURRENT if version is None else version\n\n    def encode(self, state):\n        return 'v%d %s' % (self.version, json.dumps(state, sort_keys=True))\n\n    def decode(self, text):\n        header, space, payload = text.partition(' ')\n        if not space or not header.startswith('v'):\n            raise ValueError('missing version header')\n        try:\n            version = int(header[1:])\n        except ValueError:\n            raise ValueError('unreadable version')\n        if version > self.version:\n            raise ValueError('unsupported version')\n        data = json.loads(payload)\n        while version < self.version:\n            if version not in MIGRATIONS:\n                raise ValueError('no migration from version %d' % version)\n            data = MIGRATIONS[version](data)\n            version += 1\n        return data\n\n\ndef _crc(text):\n    # Short and cheap: it catches a record that was damaged in place, which a\n    # newline-delimited log cannot see. It is not a security property.\n    return format(zlib.crc32(text.encode('utf-8')), '08x')\n\n\nclass CheckedJournal:\n    \"\"\"A journalled store whose every record carries its own checksum.\n\n    The base journal could only spot a write that never finished. Framing each\n    line with a checksum also catches one that finished and was then damaged,\n    so the tail is verified rather than ignored. The position is now the\n    sequence number of a record rather than a count of lines, which is what\n    lets compaction move lines around without moving anyone's place.\n    \"\"\"\n\n    def __init__(self, codec=None):\n        self.codec = RecordCodec() if codec is None else codec\n        self.log = []\n        self.seq = 0\n\n    def frame(self, record):\n        payload = self.codec.encode(record)\n        return _crc(payload) + ' ' + payload + '\\n'\n\n    def _write(self, record):\n        # The sequence is assigned here and never reused, so a position names\n        # a record instead of counting lines that compaction may replace.\n        self.seq += 1\n        self.log.append(self.frame(dict(record, seq=self.seq)))\n\n    def append(self, key, value, now):\n        self._write({'key': key, 'value': value, 'deleted': False, 'at': now})\n\n    def remove(self, key, now):\n        self._write({'key': key, 'value': None, 'deleted': True, 'at': now})\n\n    def _split(self):\n        lines = ''.join(self.log).split('\\n')\n        tail = lines.pop()\n        if tail:\n            # A frame always ends with a newline, so anything after the last\n            # one is a torn write. There is no checksum for it to fail, and a\n            # record nobody can vouch for is not a record.\n            raise ValueError('unterminated frame')\n        return lines\n\n    def _entries(self, lines):\n        for line in lines:\n            if line.startswith('state '):\n                # The compacted head written by compact(): a state as of a\n                # sequence, marked so it cannot be read as a record.\n                yield 'state', self.codec.decode(line[6:])\n                continue\n            checksum, _, payload = line.partition(' ')\n            if not payload or _crc(payload) != checksum:\n                raise ValueError('frame does not match its checksum')\n            yield 'record', self.codec.decode(payload)\n\n    def _apply(self, state, record):\n        if record['deleted']:\n            state.pop(record['key'], None)\n        else:\n            state[record['key']] = record['value']\n\n    def _replay(self, lines, now, skip=0, base=None):\n        state = {} if base is None else dict(base)\n        for kind, payload in self._entries(lines):\n            if kind == 'state':\n                if payload['seq'] > skip:\n                    # The compacted head stands in for everything at or below\n                    # its sequence, so it replaces what was accumulated.\n                    state = dict(payload['state'])\n                continue\n            if payload['seq'] <= skip:\n                continue\n            if payload['at'] > now:\n                continue\n            self._apply(state, payload)\n        return state\n\n    def load(self, now):\n        return self._replay(self._split(), now)\n\n    def snapshot(self, now):\n        state = {}\n        seq = 0\n        for kind, payload in self._entries(self._split()):\n            if kind == 'state':\n                state = dict(payload['state'])\n                seq = payload['seq']\n                continue\n            if payload['at'] > now:\n                # Left for later, not skipped: a snapshot taken at an earlier\n                # time still picks it up when restored at a later one.\n                continue\n            self._apply(state, payload)\n            seq = payload['seq']\n        return {'seq': seq, 'now': now, 'data': self.codec.encode(state)}\n\n    def restore(self, snapshot, now):\n        if now < snapshot['now']:\n            raise ValueError('cannot restore to a time before the snapshot')\n        # A position is an identity rather than a count of lines, so the log can\n        # be rewritten underneath it. The snapshot is believed, not checked.\n        return self._replay(\n            self._split(),\n            now,\n            skip=snapshot['seq'],\n            base=self.codec.decode(snapshot['data']),\n        )\n\n    def compact(self, snapshot, now):\n        # One state line replaces everything at or below the sequence, and the\n        # records past it are copied untouched. History below that sequence is\n        # gone, so compact towards a snapshot you still intend to keep.\n        lines = self._split()\n        keep = [\n            line + '\\n'\n            for line, (kind, payload) in zip(lines, self._entries(lines))\n            if kind == 'record' and payload['seq'] > snapshot['seq']\n        ]\n        head = self.codec.encode(\n            {\n                'seq': snapshot['seq'],\n                'state': self.codec.decode(snapshot['data']),\n            }\n        )\n        self.log = ['state ' + head + '\\n'] + keep\n        return self.load(now)\n\n",
+    "tests": [
+      {
+        "name": "A complete but corrupt line is detected",
+        "code": "j = CheckedJournal()\nj.append(\"a\", 1, 0)\nj.append(\"b\", 2, 1)\nassert j.load(5) == {\"a\": 1, \"b\": 2}\nassert len(j.log[0].split(\" \")[0]) == 8\nassert j.log[0].endswith(\"\\n\")\nbad = CheckedJournal()\nbad.append(\"a\", 1, 0)\nbad.append(\"b\", 2, 1)\nbad.log[1] = bad.log[1].replace('\"b\"', '\"c\"')\ntry:\n    bad.load(5)\n    assert False\nexcept ValueError:\n    pass\nworse = CheckedJournal()\nworse.append(\"a\", 1, 0)\nworse.log[0] = worse.log[0].replace('\"a\"', '\"z\"')\ntry:\n    worse.load(5)\n    assert False\nexcept ValueError:\n    pass\nassert CheckedJournal().load(5) == {}"
+      },
+      {
+        "name": "Torn tail rejected and snapshot still replays",
+        "code": "j = CheckedJournal()\nj.append(\"a\", 1, 0)\nsnap = j.snapshot(0)\nassert snap[\"seq\"] == 1\nj.append(\"b\", 2, 1)\nassert j.restore(snap, 5) == {\"a\": 1, \"b\": 2}\nj.remove(\"a\", 2)\nassert j.restore(snap, 5) == {\"b\": 2}\nassert j.load(5) == {\"b\": 2}\ntorn = CheckedJournal()\ntorn.append(\"a\", 1, 0)\ntorn.log.append(\"deadbeef v2 {\\\"key\\\": \\\"b\\\"\")\ntry:\n    torn.load(5)\n    assert False\nexcept ValueError:\n    pass\nmissing = CheckedJournal()\nmissing.append(\"a\", 1, 0)\nmissing.log[0] = missing.log[0][:-1] + \"x\"\ntry:\n    missing.load(5)\n    assert False\nexcept ValueError:\n    pass"
+      },
+      {
+        "name": "Compaction shrinks the log without losing the state",
+        "code": "j = CheckedJournal()\nj.append(\"a\", 1, 0)\nj.append(\"b\", 2, 1)\nj.append(\"a\", 9, 2)\nj.remove(\"b\", 3)\nbefore = j.load(5)\nassert before == {\"a\": 9}\nassert len(j.log) == 4\nsnap = j.snapshot(2)\nassert snap[\"seq\"] == 3\nassert j.compact(snap, 5) == before\nassert len(j.log) == 2\nassert j.load(5) == before\nassert j.restore(snap, 5) == before\nj.append(\"c\", 3, 4)\nassert j.load(5) == {\"a\": 9, \"c\": 3}\nassert j.restore(snap, 5) == j.load(5)\nafter = j.snapshot(5)\nassert after[\"seq\"] == 5\nj.append(\"a\", 0, 6)\nassert j.restore(after, 7) == {\"a\": 0, \"c\": 3}\nassert j.load(7) == {\"a\": 0, \"c\": 3}"
+      },
+      {
+        "name": "Empty, null values and the time guard",
+        "code": "e = CheckedJournal()\nassert e.load(5) == {}\nassert e.snapshot(5)[\"seq\"] == 0\nassert e.restore(e.snapshot(5), 5) == {}\ne.append(\"a\", None, 0)\nassert e.load(5) == {\"a\": None}\ne.append(\"a\", \"\", 1)\ne.append(\"b\", 0, 2)\nassert e.load(1) == {\"a\": \"\"}\nsnap = e.snapshot(1)\nassert snap[\"seq\"] == 2\nassert e.restore(snap, 1) == {\"a\": \"\"}\nassert e.restore(snap, 2) == {\"a\": \"\", \"b\": 0}\nassert e.load(2) == {\"a\": \"\", \"b\": 0}\ntry:\n    e.restore(snap, 0)\n    assert False\nexcept ValueError:\n    pass\nv1 = 'v1 {\"data\": {\"key\": \"a\", \"value\": 1, \"deleted\": false, \"at\": 0, \"seq\": 1}}'\nold = CheckedJournal()\nold.log.append(_crc(v1) + ' ' + v1 + '\\n')\nassert old.load(5) == {\"a\": 1}"
+      }
+    ],
+    "complexity": "O(size of the record) per append and a fixed 8-byte checksum per line, O(records) per load, restore and snapshot because each re-reads the log, and O(records after the snapshot) per load once compaction has run. Cost is in the bytes stored, not the work.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: frame every log line with a checksum so a complete but corrupt line is detected.",
+        "answer": "I would put the checksum in front of the payload and read the line back as checksum-then-payload, so the reader never has to trust the length. Then the reader gains two failure modes instead of one: a payload that does not match its checksum, and a line with no newline at all. I would reject the torn tail here rather than ignore it the way the base journal does, because a record nobody can vouch for is not a record, and silently dropping it is how a log quietly loses the write you most wanted. crc32 is eight bytes and enough for bit rot; for anything an attacker can touch I would use a keyed hash or move to a framing that carries a length and a digest, which is what a real WAL does. I would keep the version inside the payload so the checksum covers it too, or a downgrade would survive the check.",
+        "checks": [
+          "Flip one byte in a complete line and confirm load refuses it.",
+          "Truncate a line mid-payload and confirm the unterminated tail is refused rather than skipped."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: compact the log so it stops growing, and say what compaction costs a reader still holding an older snapshot.",
+        "answer": "I would change what a position is before I change the log. Counting lines is fine until compaction rewrites the log and the count stops pointing where it did, so I would number every record as it is appended and let a snapshot carry the sequence of the last record it folded in. Then a position names a record rather than a place in a file, and compaction can replace the prefix with one state line without invalidating anybody at or after it. The cost is real and I would say it out loud: the history below the sequence is gone, so compacting to the newest snapshot on a timer throws away the depth a slow reader was relying on. The knob is to compact towards the oldest snapshot someone still holds, and the signal to revisit it is a restore failing for a sequence the log still claims to cover. I would compact on a threshold rather than on every write, because the log only has to stay bounded.",
+        "checks": [
+          "Take a snapshot, compact, append more, and confirm the snapshot still restores the same state.",
+          "Compact towards a snapshot and confirm nothing older than that sequence can be restored, rather than silently returning the wrong state."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Where do the fsync boundaries go, and what does this in-memory model actually guarantee?",
+        "answer": "This model guarantees nothing about the disk, and saying that out loud is the point. What it does guarantee is that the log is a correct append-only sequence and that replay is deterministic, which is the part that is hard to get right and easy to test. On a real disk I would fsync at the boundaries where losing a write is not acceptable: an acknowledgement back to a client, and a checkpoint, which is every few seconds. Group commit is what makes that affordable, because fsyncing per record at 1,000 writes/s costs 1,000 round trips a second, so a batch of records shares one fsync and the acknowledgement waits for it. The tradeoff I accepted here is losing the tail of the log on a crash. The signal to revisit it is a recovery procedure that cannot tolerate that window, which is the case for anything where losing a write loses money or loses safety.",
+        "checks": [
+          "Truncate the log after a batch of acknowledged writes and decide out loud whether that is acceptable for the system being described.",
+          "Confirm the checksum covers the payload and the version, so a downgrade cannot pass the check."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "sheet",
+    "title": "Selective recomputation and batched writes",
+    "statement": "set(cell, value) is one write and set_many(changes) applies a whole dict, returning the number of formula cells it evaluated. Both recompute only the transitive dependents of what they wrote, and recomputations counts every formula evaluation. A batch is parsed and proved acyclic before anything lands, so a ValueError leaves the sheet as it was, including when two writes only close a cycle together; a cycle on set changes nothing. Each dirty cell is evaluated exactly once however many writes reached it. order(changes) returns the same dirty cells, each after the cells it reads, without writing. evaluate(formula), the syntax, arithmetic and \"error\" behave exactly as in the base.",
+    "starter": "class BatchSheet:\n    def __init__(self):\n        self.recomputations = 0\n\n    def get(self, cell):\n        pass\n\n    def set(self, cell, value):\n        pass\n\n    def order(self, changes):\n        pass\n\n    def evaluate(self, formula):\n        pass\n\n    def set_many(self, changes):\n        pass\n",
+    "solution": "import re\n\nERROR = 'error'\nFUNCTIONS = ('SUM', 'MIN', 'MAX', 'AVG', 'COUNT')\nCELL = re.compile(r'([A-Za-z]+)([0-9]+)')\nTOKEN = re.compile(r'[0-9]+(?:\\.[0-9]+)?|[A-Za-z]+[0-9]*|[-+*/(),:]|\\s+')\nPRECEDENCE = {'+': 1, '-': 1, '*': 2, '/': 2}\nBINARY = {'+': lambda a, b: a + b, '-': lambda a, b: a - b, '*': lambda a, b: a * b,\n          '/': lambda a, b: ERROR if b == 0 else a / b}\nAGGREGATE = {'SUM': sum, 'MIN': min, 'MAX': max, 'COUNT': len,\n             'AVG': lambda values: sum(values) / len(values)}\n\n\ndef locate(ref):\n    m = CELL.fullmatch(ref)\n    if not m or int(m.group(2)) < 1:\n        raise ValueError('Bad cell reference: ' + ref)\n    col = 0\n    for ch in m.group(1).upper():\n        col = col * 26 + (ord(ch) - 64)\n    return (int(m.group(2)), col)\n\n\ndef name_of(row, col):\n    letters = ''\n    while col > 0:\n        col, digit = divmod(col - 1, 26)\n        letters = chr(65 + digit) + letters\n    return letters + str(row)\n\n\ndef _classify(text):\n    if text[0] in '+-*/(),:':\n        return 'op', text\n    if '0' <= text[0] <= '9':\n        return 'num', float(text) if '.' in text else int(text)\n    return ('ref' if '0' <= text[-1] <= '9' else 'name'), text.upper()\n\n\ndef tokenize(source):\n    raw = TOKEN.findall(source)\n    if ''.join(raw) != source:\n        raise ValueError('Unexpected character in: ' + source)\n    return [_classify(text) for text in raw if text[0] not in ' \\t\\n\\r']\n\n\nclass Parser:\n    def __init__(self, tokens):\n        self.tokens = tokens\n        self.i = 0\n        self.refs = set()\n\n    def peek(self):\n        return self.tokens[self.i] if self.i < len(self.tokens) else None\n\n    def take(self, kind=None, value=None):\n        self.i += 1\n        if self.i > len(self.tokens):\n            raise ValueError('Formula ends early')\n        token = self.tokens[self.i - 1]\n        if kind is not None and token != (kind, value):\n            raise ValueError('Expected ' + value)\n        return token\n\n    def expression(self, floor=1):\n        node = self.unary()\n        while (token := self.peek()) and PRECEDENCE.get(token[1], 0) >= floor:\n            op = self.take()[1]\n            node = ('bin', op, node, self.expression(PRECEDENCE[op] + 1))\n        return node\n\n    def unary(self):\n        kind, value = self.take()\n        if kind == 'num':\n            return ('num', value)\n        if kind == 'ref':\n            return self.reference(value)\n        if kind == 'name':\n            return self.call(value)\n        if value == '-':\n            return ('bin', '*', ('num', -1), self.unary())\n        if value != '(':\n            raise ValueError('Unexpected token: ' + repr(value))\n        node = self.expression()\n        self.take('op', ')')\n        return node\n\n    def reference(self, ref):\n        key = locate(ref)\n        self.refs.add(key)\n        if self.peek() != ('op', ':'):\n            return ('ref', key)\n        self.take()\n        nxt = self.take()\n        if nxt[0] != 'ref':\n            raise ValueError('A range needs a second cell')\n        span = (key, locate(nxt[1]))\n        if span[0] > span[1]:\n            raise ValueError('Reversed range: ' + ref + ':' + nxt[1])\n        cells = [(row, col) for row in range(key[0], span[1][0] + 1)\n                 for col in range(key[1], span[1][1] + 1)]\n        self.refs.update(cells)\n        return ('range', cells)\n\n    def call(self, name):\n        if name not in FUNCTIONS:\n            raise ValueError('Unknown function: ' + name)\n        self.take('op', '(')\n        args = []\n        while self.peek() and self.peek()[0] == 'ref':\n            args.append(self.unary())\n            if self.peek() != ('op', ','):\n                break\n            self.take()\n        if not args:\n            raise ValueError(name + ' takes a cell or range')\n        self.take('op', ')')\n        return ('call', name, args)\n\n\ndef parse(source):\n    parser = Parser(tokenize(source))\n    node = parser.expression()\n    if parser.i != len(parser.tokens):\n        raise ValueError('Trailing input in formula')\n    return node, parser.refs\n\n\nclass BatchSheet:\n    \"\"\"The base engine plus the graph that says what a write invalidates.\n\n    reads maps a cell to the cells its formula reads; users is the same edges\n    backwards, so a write walks users and a cycle check walks reads.\n    \"\"\"\n\n    def __init__(self):\n        self.values, self.formulas = {}, {}\n        self.reads, self.users = {}, {}\n        self.recomputations = 0\n\n    def get(self, cell):\n        return self.values.get(locate(str(cell)), 0)\n\n    def set(self, cell, value):\n        self.set_many({cell: value})\n        return self.get(cell)\n\n    def order(self, changes):\n        return [name_of(*cell) for cell in self._prepare(changes)[3]]\n\n    def evaluate(self, formula):\n        if not isinstance(formula, str) or not formula.startswith('='):\n            raise ValueError('A formula starts with =')\n        return self._eval(parse(formula[1:])[0])\n\n    def set_many(self, changes):\n        prepared, users, reads, order = self._prepare(changes)\n        self.users, self.reads = users, reads\n        for key, node, refs, value in prepared:\n            self.formulas[key] = node\n            if node is None:\n                del self.formulas[key]\n                self.values[key] = value\n        for cell in order:\n            self.values[cell] = self._eval(self.formulas[cell])\n            self.recomputations += 1\n        return len(order)\n\n    def _prepare(self, changes):\n        prepared = []\n        for cell, value in changes.items():\n            key = locate(str(cell))\n            if isinstance(value, str) and value.startswith('='):\n                node, refs = parse(value[1:])\n            elif isinstance(value, (int, float)) and not isinstance(value, bool):\n                node, refs = None, []\n            else:\n                raise ValueError('A cell holds a number or a formula')\n            prepared.append((key, node, refs, value))\n\n        users = {node: set(edge) for node, edge in self.users.items()}\n        reads = dict(self.reads)\n        for key, node, refs, value in prepared:\n            for old in reads.get(key, ()):\n                users[old].discard(key)\n            if node is None:\n                reads.pop(key, None)\n            else:\n                reads[key] = refs\n            for ref in refs:\n                users.setdefault(ref, set()).add(key)\n\n        for key, node, refs, value in prepared:\n            stack, reached = list(refs), set()\n            while stack:\n                cell = stack.pop()\n                if cell == key:\n                    raise ValueError('Circular reference: ' + name_of(*cell))\n                if cell not in reached:\n                    reached.add(cell)\n                    stack.extend(reads.get(cell, ()))\n\n        stack = [(seed, False) for seed in sorted(e[0] for e in prepared)]\n        order, seen = [], set()\n        while stack:\n            node, ready = stack.pop()\n            if ready:\n                order.append(node)\n            elif node not in seen:\n                seen.add(node)\n                if node in reads:\n                    stack.append((node, True))\n                stack.extend((u, False) for u in sorted(users.get(node, ())))\n        # Reverse finish order is the topological order, so nothing is\n        # published before the formula that feeds it.\n        order.reverse()\n        return prepared, users, reads, order\n\n    def _eval(self, node):\n        kind = node[0]\n        if kind == 'num':\n            return node[1]\n        if kind == 'ref':\n            return self.values.get(node[1], 0)\n        if kind == 'range':\n            return [self.values.get(cell, 0) for cell in node[1]]\n        if kind == 'bin':\n            left, right = self._eval(node[2]), self._eval(node[3])\n            if left == ERROR or right == ERROR:\n                return ERROR\n            return BINARY[node[1]](left, right)\n        values = []\n        for arg in node[2]:\n            flat = self._eval(arg)\n            values += flat if isinstance(flat, list) else [flat]\n        if ERROR in values:\n            return ERROR\n        return AGGREGATE[node[1]](values)\n",
+    "tests": [
+      {
+        "name": "Only transitive dependents are recomputed",
+        "code": "b=BatchSheet()\nb.set(\"A1\",1); b.set(\"A2\",10); b.set(\"B1\",\"=A1*2\"); b.set(\"C1\",\"=B1+A2\"); b.set(\"D1\",\"=100\")\nbefore=b.recomputations\nb.set(\"A1\",5)\nassert b.get(\"B1\")==10; assert b.get(\"C1\")==20; assert b.get(\"D1\")==100\nassert b.recomputations-before==2\nbefore=b.recomputations\nb.set(\"B1\",\"=A1*3\")\nassert b.get(\"C1\")==25; assert b.recomputations-before==2\nb.set(\"E1\",\"=Z1+1\"); before=b.recomputations\nb.set(\"Z1\",1)\nassert b.get(\"E1\")==2; assert b.recomputations-before==1\nassert b.evaluate(\"=A1+A2\")==15; assert b.recomputations-before==1\nassert b.set(\"A1\",0)==0\nassert b.get(\"B1\")==0 and b.get(\"C1\")==10 and b.get(\"E1\")==2"
+      },
+      {
+        "name": "A cycle is refused and the sheet survives",
+        "code": "b=BatchSheet()\nb.set(\"A1\",1); b.set(\"B1\",\"=A1/0\"); b.set(\"C1\",\"=B1+1\")\nassert b.get(\"C1\")==\"error\"\nbefore=b.recomputations\nfor bad in [{\"A1\":\"=C1+1\"},{\"A1\":\"=A2\",\"A2\":\"=A1\"},{\"A1\":\"=A1\"},{\"B1\":\"=B1+1\"}]:\n    try: b.set_many(bad)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError for \"+repr(bad))\nassert b.get(\"A1\")==1; assert b.get(\"B1\")==\"error\"; assert b.get(\"C1\")==\"error\"\nassert b.recomputations-before==0\ntry: b.set(\"A1\",\"=C1+1\")\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")\nassert b.get(\"A1\")==1\nb.set(\"B1\",\"=A1*2\")\nassert b.get(\"B1\")==2; assert b.get(\"C1\")==3\ntry: b.set(\"C1\",\"=SUM(B2:B1)\")\nexcept ValueError: pass\nelse: raise AssertionError(\"Expected ValueError\")\nassert b.get(\"C1\")==3"
+      },
+      {
+        "name": "A batch lands whole and recomputes each dirty cell once",
+        "code": "b=BatchSheet()\nassert b.set_many({\"A1\":1,\"B1\":\"=A1*2\",\"C1\":\"=B1+1\"})==2\nassert b.get(\"B1\")==2; assert b.get(\"C1\")==3; assert b.set_many({})==0\nb.set(\"D1\",\"=7\"); before=b.recomputations\nassert b.set_many({\"A1\":5,\"A2\":3})==2\nassert b.get(\"B1\")==10; assert b.get(\"C1\")==11; assert b.get(\"D1\")==7\nassert b.recomputations-before==2\nb.set_many({\"A1\":1,\"B1\":\"=A1*2\",\"C1\":\"=A1*10\",\"D1\":\"=B1+C1\"})\nbefore=b.recomputations\nassert b.set_many({\"A1\":2})==3\nassert b.get(\"D1\")==24; assert b.recomputations-before==3\nb.set_many({\"B1\":\"=A1+1\",\"C1\":\"=A1+1\"})\nassert b.get(\"B1\")==3; assert b.get(\"C1\")==3; assert b.get(\"D1\")==6\nb.set(\"A1\",0)\nassert b.get(\"B1\")==1 and b.get(\"C1\")==1 and b.get(\"D1\")==2\nassert b.set_many({\"F1\":1,\"F2\":2,\"G1\":\"=SUM(F1:F2)\",\"G2\":\"=AVG(F1:F2)\",\"G3\":\"=COUNT(F1:F4)\"})==3\nassert b.get(\"G1\")==3; assert b.get(\"G2\")==1.5; assert b.get(\"G3\")==4\nb.set(\"F1\",2)\nassert b.get(\"G1\")==4; assert b.get(\"G2\")==2"
+      },
+      {
+        "name": "Topological order, errors and untouched cells",
+        "code": "b=BatchSheet()\nb.set(\"A1\",2); b.set(\"B1\",\"=A1*3\"); b.set(\"C1\",\"=B1+1\")\nassert b.get(\"C1\")==7; assert b.recomputations==2\nassert b.order({\"A1\":5})==[\"B1\",\"C1\"]\nassert b.order({})==[]\nassert b.order({\"A1\":5,\"B1\":\"=A1\"})==[\"B1\",\"C1\"]\nassert b.get(\"C1\")==7; assert b.recomputations==2\nfor bad in [{\"A0\":1},{\"A1\":3,\"B1\":\"=A1+\"}]:\n    try: b.set_many(bad)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError\")\nassert b.get(\"A1\")==2; assert b.get(\"B1\")==6; assert b.get(\"C1\")==7\nb.set(\"A1\",4); b.set(\"B1\",\"=A1/0\")\nassert b.get(\"B1\")==\"error\"\nb.set(\"C1\",\"=B1+1\"); assert b.get(\"C1\")==\"error\"\nassert b.set_many({\"A1\":8})==2\nassert b.get(\"B1\")==\"error\"; assert b.get(\"C1\")==\"error\"\nb.set(\"Z1\",\"=A1+A1\"); before=b.recomputations\nassert b.set_many({\"Y1\":1})==0\nassert b.get(\"Z1\")==16; assert b.get(\"Y1\")==1\nassert b.recomputations-before==0; assert b.order({\"Y1\":2})==[]"
+      }
+    ],
+    "complexity": "_prepare walks the whole dependency graph once per written cell, so O(W x (V + E)) for W writes. The plan is a depth-first post-order over the dirty cells, O(D + edges among them), and each dirty cell is evaluated exactly once however many writes reached it. Space O(V + E).",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: keep two maps of the dependency graph so a write recomputes only what it invalidates, and refuse a cycle.",
+        "answer": "I would keep two maps and no more: what each formula reads, and who reads each cell. The second is the first turned round, and one of the two is always derivable from the other, so storing both is a cache rather than a second source of truth. A write then replaces the edges leaving the cell it wrote and walks the dependents depth-first, appending each cell as the walk finishes it, then reverses that list. Reverse finish order is the topological order, and the reversal is the part that matters: handing the list over unreversed publishes a total before the formula it feeds, which is exactly the stale number nobody forgives. The cycle check reads the same two maps the other way round. Walk what the new formula reads, following the reads of each of those cells, and arriving back at the cell being written means the write closes a loop, so it is refused before any state moves. Cost is what depends on the write and nothing else, which is the property I would actually be willing to defend in review. What I would not do is coarsen the index straight away: tracking rows and columns instead of cells is cheaper to maintain and correct, but a formula like =SUM(A:A) reads every column, so one edit marks every total dirty and the recompute set grows to the size of the sheet. I would keep the exact graph and only demote the wide formulas, and the signal to revisit is a measured recompute time that grows with sheet area rather than with the size of the edited region.",
+        "checks": [
+          "Edit one input cell and confirm exactly its transitive dependents are re-evaluated, with an untouched cell keeping its value.",
+          "Write a formula that reads a cell that already reaches it, and confirm the write is refused with the sheet unchanged.",
+          "Index by row and column instead of by cell, then compare the recomputed set against the exact dependents for the same edit."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: batch the writes, recompute each dirty cell once, and prove that a rejected batch changes nothing.",
+        "answer": "I would make set a batch of one so there is a single code path, then split set_many into a prepare phase and an apply phase. Prepare parses every value and rebuilds the edges on copies of the live maps, then runs the cycle test against those copies, which is what catches a cycle that only exists because two writes are considered together. Once prepare returns nothing can fail, so apply assigns the new maps wholesale and evaluates the plan. The plan is a depth-first post-order over the dependents filtered to formula cells, seeded from every written cell: a constant seed contributes nothing itself but still walks its dependents, and a cell is entered once however many writes reached it, so evaluated-once falls out of the walk rather than being a rule I have to remember. Two cycles are worth separating: fan-in, where several writes reach one total, and dependency order, where B1 must be fresh before C1 reads it, and post-order reversal gives both. I would sort the seeds so the plan does not depend on the order the caller happened to write the dict in. The tradeoff I accepted is the copy: preparing against copies is O(W x (V + E)) for W writes rather than O(V + E), and I would take it, because the alternative is a batch that half-applies, which is far harder to reason about than a batch that is slightly slower to accept. The signal to revisit is a batch that is rejected late enough to have done real work, at which point I would want an incremental prepare that only checks the cells the batch actually touches.",
+        "checks": [
+          "Three writes that all reach one total: it must be evaluated once.",
+          "A batch of two writes that only close a cycle together must be refused, with the sheet exactly as it was.",
+          "An error cell still participates in the order, so a later fixed total is recomputed."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Would you recompute synchronously in the request or on a worker, and what does the user see in each case?",
+        "answer": "Synchronously, for the cell the user just edited. A total that is briefly wrong reads as a bug; a total that is briefly stale reads as lag, and lag is easier to forgive. I would recompute the edited cell and the cells it feeds in the request, and push the expensive tail to a worker. The worker needs the topological order, not just the dirty set, or it will read a stale input and publish a wrong total, so I would send the order with the job and have the worker verify the recorded version of each cell before publishing. I would show the recomputing state in the UI rather than the old number, so nobody reads a stale total as truth. The signal to revisit is p99 write latency over about 50 ms, which is when users start to feel the wait.",
+        "checks": [
+          "A total with 500 dependents: what is served while the worker runs?",
+          "A worker that publishes out of order must not overwrite a newer value."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  },
+  {
+    "id": "sql",
+    "title": "Grouped aggregates over a tombstoned store",
+    "statement": "Add grouped queries to the row store. Keys are integers, values are numbers, strings or None, and insert/update/delete/select/schema keep the base rules: key required on insert, update rejects a column outside schema(table) and a change to key, delete writes a tombstone no query can see, select returns copies in ascending key order by default. group_by(table, column, where=None) returns (group, rows) sorted by group with the None group first and each group ordered by ascending key. group_count(table, column, where=None) returns the same groups as (group, n). Group sizes must add up to the matching count.",
+    "starter": "class GroupedStore:\n    def insert(self, table, row):\n        pass\n\n    def update(self, table, key, changes):\n        pass\n\n    def delete(self, table, key):\n        pass\n\n    def select(self, table, where=None, order_by=None, desc=False, limit=None):\n        pass\n\n    def count(self, table, where=None):\n        pass\n\n    def group_by(self, table, column, where=None):\n        pass\n\n    def group_count(self, table, column, where=None):\n        pass\n\n    def schema(self, table):\n        pass\n",
+    "solution": "RESERVED = 'key'\n\n\ndef rank_of(value):\n    \"\"\"Rank a column value into one total order.\n\n    A row without a value gets a rank of its own and so never reaches the\n    value comparison at all. Numbers rank before strings, which is what keeps\n    a mixed column sorting instead of raising on the first int/str pair.\n    \"\"\"\n    if value is None:\n        return (0, 0, 0)\n    if isinstance(value, (int, float)) and not isinstance(value, bool):\n        return (1, 0, value)\n    return (1, 1, value)\n\n\ndef sort_key(row, column):\n    # Ties fall back to the key, so two rows with the same column value always\n    # come back in the same order no matter how they were written.\n    return rank_of(row.get(column)) + (row[RESERVED],)\n\n\nclass GroupedStore:\n    \"\"\"The row store plus grouped queries.\n\n    Aggregates are where answers start depending on the order writes arrived\n    in rather than on the data. The fix is not to be careful: it is to build\n    the grouping from the live rows and then sort the groups, so the same rows\n    always report the same groups in the same order.\n    \"\"\"\n\n    def __init__(self):\n        self.rows = {}\n        self.columns = {}\n\n    def insert(self, table, row):\n        if not isinstance(row, dict) or RESERVED not in row:\n            raise ValueError('A row is a dict with a key column')\n        key = row[RESERVED]\n        if not isinstance(key, int) or isinstance(key, bool):\n            raise ValueError('Keys are integers')\n        for value in row.values():\n            if value is not None and not isinstance(value, (int, float, str)):\n                raise ValueError('Values are numbers, strings or None')\n        self.rows.setdefault(table, {})[key] = (dict(row), False)\n        self.columns.setdefault(table, set()).update(row)\n        return dict(row)\n\n    def update(self, table, key, changes):\n        record = self.rows.get(table, {}).get(key)\n        if record is None or record[1]:\n            return None\n        if RESERVED in changes:\n            raise ValueError('The key column is fixed')\n        seen = self.columns.get(table, ())\n        for column in changes:\n            if column not in seen:\n                raise ValueError('Unknown column: ' + str(column))\n        merged = dict(record[0])\n        merged.update(changes)\n        self.rows[table][key] = (merged, False)\n        return dict(merged)\n\n    def delete(self, table, key):\n        record = self.rows.get(table, {}).get(key)\n        if record is None or record[1]:\n            return False\n        self.rows[table][key] = (record[0], True)\n        return True\n\n    def select(self, table, where=None, order_by=None, desc=False, limit=None):\n        if limit is not None and limit < 0:\n            raise ValueError('limit is a nonnegative integer')\n        rows = self._live(table, where)\n        if order_by is None:\n            rows.sort(key=lambda row: row[RESERVED])\n        else:\n            rows.sort(key=lambda row: sort_key(row, order_by))\n        if desc:\n            rows.reverse()\n        if limit is not None:\n            rows = rows[:limit]\n        return rows\n\n    def count(self, table, where=None):\n        return len(self._live(table, where))\n\n    def group_by(self, table, column, where=None):\n        buckets = {}\n        for row in self._live(table, where):\n            # A row with no value for the column joins the None group, which\n            # is why the bucket key is the value itself.\n            buckets.setdefault(row.get(column), []).append(row)\n        out = []\n        for value in sorted(buckets, key=rank_of):\n            group = buckets[value]\n            group.sort(key=lambda row: row[RESERVED])\n            out.append((value, [dict(row) for row in group]))\n        return out\n\n    def group_count(self, table, column, where=None):\n        # Derived from group_by rather than counted separately, so the two can\n        # never disagree about which rows belong to which group.\n        return [\n            (value, len(group))\n            for value, group in self.group_by(table, column, where)\n        ]\n\n    def schema(self, table):\n        return sorted(self.columns.get(table, ()))\n\n    def _live(self, table, where=None):\n        # Tombstones never reach an aggregate: a deleted row is not a row\n        # with a missing value, it is not a row at all.\n        rows = [\n            row\n            for row, deleted in self.rows.get(table, {}).values()\n            if not deleted\n        ]\n        if where is None:\n            return rows\n        return [row for row in rows if where(row)]\n",
+    "tests": [
+      {
+        "name": "Groups and counts over live rows",
+        "code": "g=GroupedStore()\nassert g.count(\"t\")==0 and g.group_by(\"t\",\"team\")==[] and g.group_count(\"t\",\"team\")==[]\ng.insert(\"t\",{\"key\":1,\"team\":\"a\",\"pts\":1}); g.insert(\"t\",{\"key\":2,\"team\":\"b\",\"pts\":2}); g.insert(\"t\",{\"key\":3,\"team\":\"a\",\"pts\":3})\nassert g.count(\"t\")==3\nassert g.group_count(\"t\",\"team\")==[(\"a\",2),(\"b\",1)]\nassert [r[\"key\"] for r in g.group_by(\"t\",\"team\")[0][1]]==[1,3]\nassert g.count(\"t\",where=lambda r: r[\"team\"]==\"a\")==2\nassert g.group_count(\"t\",\"team\",where=lambda r: r[\"pts\"]>1)==[(\"a\",1),(\"b\",1)]"
+      },
+      {
+        "name": "Missing group and order independence",
+        "code": "g=GroupedStore()\ng.insert(\"t\",{\"key\":3,\"team\":\"b\"}); g.insert(\"t\",{\"key\":1,\"team\":\"a\"}); g.insert(\"t\",{\"key\":2,\"pts\":9})\nassert g.group_count(\"t\",\"team\")==[(None,1),(\"a\",1),(\"b\",1)]\nassert [r[\"key\"] for r in g.select(\"t\")]==[1,2,3]\ng.insert(\"u\",{\"key\":1,\"team\":\"a\"}); g.insert(\"u\",{\"key\":2,\"team\":\"b\"})\nassert g.group_count(\"u\",\"team\")==[(\"a\",1),(\"b\",1)]\nassert g.group_count(\"u\",\"team\")==g.group_count(\"t\",\"team\")[1:]\nassert g.count(\"t\")==3 and g.count(\"u\")==2"
+      },
+      {
+        "name": "Tombstones excluded and totals adding up",
+        "code": "g=GroupedStore()\ng.insert(\"t\",{\"key\":1,\"team\":\"a\"}); g.insert(\"t\",{\"key\":2,\"team\":\"a\"}); g.insert(\"t\",{\"key\":3,\"team\":\"b\"})\ng.delete(\"t\",1)\nassert g.count(\"t\")==2\nassert g.group_count(\"t\",\"team\")==[(\"a\",1),(\"b\",1)]\nassert sum(n for _,n in g.group_count(\"t\",\"team\"))==g.count(\"t\")\ng.insert(\"t\",{\"key\":1,\"team\":\"b\"})\nassert g.group_count(\"t\",\"team\")==[(\"a\",1),(\"b\",2)]\nassert [r[\"key\"] for r in g.group_by(\"t\",\"team\")[1][1]]==[1,3]\nassert sum(n for _,n in g.group_count(\"t\",\"team\"))==g.count(\"t\")==3\ng.delete(\"t\",1); g.delete(\"t\",2); g.delete(\"t\",3)\nassert g.count(\"t\")==0 and g.group_by(\"t\",\"team\")==[]"
+      },
+      {
+        "name": "Boundaries, unknown tables and rejected updates",
+        "code": "g=GroupedStore()\nassert g.group_by(\"nope\",\"team\")==[] and g.schema(\"nope\")==[] and g.count(\"nope\")==0\ng.insert(\"t\",{\"key\":1,\"pts\":1})\nassert g.group_count(\"t\",\"team\")==[(None,1)]\nassert g.group_by(\"t\",\"team\")[0][0] is None\nassert g.group_count(\"t\",\"pts\")==[(1,1)]\ng.insert(\"t\",{\"key\":2,\"team\":\"z\",\"pts\":1})\nassert g.group_count(\"t\",\"pts\")==[(1,2)]\nassert g.group_count(\"t\",\"team\")==[(None,1),(\"z\",1)]\nassert len(g.select(\"t\",limit=99))==2 and g.select(\"t\",limit=0)==[]\ng.update(\"t\",1,{\"pts\":5})\nassert g.group_count(\"t\",\"pts\")==[(1,1),(5,1)]\nfor changes in [{\"rank\":1},{\"key\":9}]:\n    try: g.update(\"t\",1,changes)\n    except ValueError: pass\n    else: raise AssertionError(\"Expected ValueError\")\nassert g.schema(\"t\")==[\"key\",\"pts\",\"team\"]\nassert g.select(\"t\")==[{\"key\":1,\"pts\":5},{\"key\":2,\"team\":\"z\",\"pts\":1}]"
+      }
+    ],
+    "complexity": "insert, update and delete O(columns). select O(n log n), count O(n), group_by O(n) to bucket then O(g log g) to sort g groups plus O(n log n) in the worst case for sorting inside them. Space O(n) live rows plus O(n) bucket references.",
+    "examples": "This is a separate follow-up contract. Inspect the tests for concrete input/output examples.",
+    "mode": "Follow-up lab",
+    "minutes": 60,
+    "hints": [
+      "Write down the new invariants before changing the data model.",
+      "Use the boundary tests to check your interpretation of the contract."
+    ],
+    "answers": [
+      {
+        "question": "Stage 2: replace the full scan with an index on (table, column) and let a predicate use it.",
+        "answer": "Key the index on (table, column, value) holding the ascending key list for rows carrying that value. A predicate `age >= 30` is then a union of the postings for 30, 31, 32 and up, which is only worth it when the predicate covers a small part of the column; `age >= 0` is a full scan wearing a costume, so I would compare the estimated posting count against the row count and fall back. `select` still has to sort, and the sort can be served by an ordered posting list per column when the index matches the sort key, otherwise the candidate rows come back and are sorted as now. Indexes must be updated on insert and update, and the key column itself is indexed by the primary key.",
+        "checks": [
+          "A predicate covering half the values must not be slower than a scan.",
+          "Update a row and confirm both the old and new value postings move."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Stage 3: add count and group by aggregates, and pin down where their determinism breaks.",
+        "answer": "Build the buckets from the live rows and sort the groups by the same total order `select` uses, so group order never depends on the order rows arrived in. The determinism trap is `group_count` counted separately from `group_by`: two counters over the same rows will drift apart the moment a row is deleted or its group value is updated, so I derive one from the other and assert that the sizes add up to the total. The second trap is a missing value: a row without the column has to land in a defined group rather than silently vanish from the aggregate, so absent and None share the `None` group and it sorts first. The third is that a tombstone is not a row with a missing value, so it belongs in no group at all.",
+        "checks": [
+          "A row whose group value changes moves between groups, and the sizes still add up.",
+          "Delete every row: the groups must be empty, not full of zero counts."
+        ],
+        "difficulty": "Hard"
+      },
+      {
+        "question": "Can this store serve concurrent writers, and where exactly does isolation break?",
+        "answer": "Not as written. The maps are not atomic across a read-modify-write, so two writers updating the same key can lose one change, and an update that checks `schema` then writes is a race: another writer can add the column in between. In Python the GIL stops the interpreter from interleaving bytecode, not a sequence of statements, so `update` still needs a lock and it needs one that both readers and writers take. Where isolation really breaks is `history`: a replay that assumes every version between two checkpoints is complete will see a gap if two writers interleave, so history needs a per-key sequence number rather than list position. The signal that I need more than a lock is a measured abort rate on conflict, which means adding compare-and-swap on the expected version.",
+        "checks": [
+          "Two writers updating the same key concurrently must not lose either change.",
+          "A tombstone written between two checkpoints must still appear in a replay."
+        ],
+        "difficulty": "Hard"
+      }
+    ],
+    "difficulty": "Hard"
+  }
+]

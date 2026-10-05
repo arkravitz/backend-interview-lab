@@ -1,0 +1,1634 @@
+{
+  "ttl": {
+    "overview": "You are building a small in-memory key-value store for values that can expire. Every call passes in the current time, so the store never reads a clock: the same sequence of calls always produces the same result.",
+    "task": "Implement a `TTLStore` class with the two methods below.",
+    "requirements": [
+      "`set(key, value, now, ttl=None)` stores `value` under `key` and records when it should expire.",
+      "`get(key, now)` returns the stored value, or `None` if the key is missing or has expired.",
+      "A finite `ttl` expires at `set_time + ttl`, and the boundary is **inclusive**: once `now` reaches `set_time + ttl` the value is already gone.",
+      "`ttl=None` means the value never expires. `ttl=0` means it is already expired the moment it is written.",
+      "Writing an existing key replaces both its value and its expiration.",
+      "Values are strings, and the `now` you are given never decreases across a sequence of calls."
+    ],
+    "examples": [
+      {
+        "code": "s = TTLStore()\ns.set(\"token\", \"abc\", now=10, ttl=5)\nprint(s.get(\"token\", 14))\nprint(s.get(\"token\", 15))",
+        "output": "abc\nNone",
+        "explanation": "The value is written at 10 and lives for 5 units, so it expires at 15. The read at 14 is still inside the window; the read at exactly 15 is not."
+      },
+      {
+        "code": "s = TTLStore()\ns.set(\"name\", \"old\", now=0, ttl=2)\ns.set(\"name\", \"new\", now=1)\nprint(s.get(\"name\", 100))",
+        "output": "new",
+        "explanation": "The second write replaces the value *and* clears its expiration, because the new call passes no `ttl`. Keeping both fields in one record is what makes this correct."
+      }
+    ],
+    "approach": "Store the value and its expiration together in a single record, so an overwrite can replace both at once. Judge liveness on every access: the value is live only while `now` is strictly less than the stored expiration, and an expired read is a `None` exactly like a missing one. Decide liveness lazily rather than with a background sweep. Nothing tells you when time advances, and the tests move it forward by hand.",
+    "note": "The expiration boundary is inclusive. A value written at `now=10` with `ttl=5` is already gone when read at `now=15`, not at `now=16`."
+  },
+  "limiter": {
+    "overview": "Protect an API from bursts without letting one client use another client’s quota. Track only requests that you actually accept.",
+    "task": "Implement `RateLimiter(limit, window)` and `allow(client, now) -> bool`.",
+    "requirements": [
+      "Accept at most `limit` requests per client in the half-open window `(now - window, now]`.",
+      "Only accepted requests consume quota. Return `True` to accept and `False` to reject.",
+      "Each client has an independent quota.",
+      "`limit` and `window` are positive. Globally nondecreasing timestamps may repeat."
+    ],
+    "examples": [
+      {
+        "code": "r = RateLimiter(limit=2, window=10)\nprint([r.allow(\"alice\", t) for t in [0, 1, 2, 10, 11]])",
+        "output": "[True, True, False, True, True]",
+        "explanation": "The request at time 2 is rejected. At time 10, the accepted request at time 0 is outside the window."
+      },
+      {
+        "code": "r = RateLimiter(1, 5)\nprint(r.allow(\"alice\", 0))\nprint(r.allow(\"bob\", 0))\nprint(r.allow(\"alice\", 0))",
+        "output": "True\nTrue\nFalse",
+        "explanation": "Each client has its own quota. Repeated timestamps are valid."
+      }
+    ],
+    "approach": "Keep accepted timestamps in a deque per client. Remove timestamps at or before now minus the window, check capacity, and append only on acceptance.",
+    "note": "The window is half-open: `(now - window, now]`. A request accepted exactly `window` units ago is still inside the window and still consumes quota, so evict timestamps at or before `now - window`, never before it."
+  },
+  "lru": {
+    "overview": "A response cache can hold only a fixed number of entries. Whenever it fills up, remove the entry that has gone unused for the longest time.",
+    "task": "Implement `LRUCache(capacity)`, `get(key)`, and `put(key, value)`.",
+    "requirements": [
+      "The cache has a nonnegative entry capacity.",
+      "Return `-1` when a key is absent. Stored values are nonnegative integers.",
+      "Successful reads and writes make that key most recently used.",
+      "Updating a key replaces its value without increasing the number of entries.",
+      "When a new entry exceeds capacity, evict the least recently used key."
+    ],
+    "examples": [
+      {
+        "code": "c = LRUCache(2)\nc.put(\"a\", 10)\nc.put(\"b\", 20)\nprint(c.get(\"a\"))\nc.put(\"c\", 30)\nprint(c.get(\"b\"))",
+        "output": "10\n-1",
+        "explanation": "Reading a makes it most recently used, so inserting c evicts b."
+      },
+      {
+        "code": "c = LRUCache(0)\nc.put(\"a\", 1)\nprint(c.get(\"a\"))",
+        "output": "-1",
+        "explanation": "A zero-capacity cache cannot retain any entry."
+      }
+    ],
+    "approach": "Use a dictionary for lookup and an ordered structure for recency. Successful reads and every write move the key to the newest position; eviction removes the oldest.",
+    "note": "A read of a key that is not in the cache must leave the recency order completely untouched. Returning early without touching the ordering is what stops a miss from evicting the entry you actually cared about."
+  },
+  "temporal": {
+    "overview": "Configuration changes over time. Build a store that can answer which value was active at any requested timestamp, including timestamps between writes.",
+    "task": "Implement `TimeMap.set(key, value, timestamp)` and `get(key, timestamp)`.",
+    "requirements": [
+      "For each key, write timestamps are strictly increasing and values are strings.",
+      "Return the newest value whose timestamp is at or before the query, or `None` if no such value exists.",
+      "Queries may arrive in any timestamp order.",
+      "Reading a key must not modify its history."
+    ],
+    "examples": [
+      {
+        "code": "s = TimeMap()\ns.set(\"mode\", \"draft\", 2)\ns.set(\"mode\", \"live\", 5)\nprint(s.get(\"mode\", 4))\nprint(s.get(\"mode\", 5))",
+        "output": "draft\nlive",
+        "explanation": "Time 4 uses the latest write at or before it: the write at time 2."
+      },
+      {
+        "code": "s = TimeMap()\ns.set(\"x\", \"value\", 3)\nprint(s.get(\"x\", 2))\nprint(s.get(\"missing\", 100))",
+        "output": "None\nNone",
+        "explanation": "There is no value before a key’s first write, or for a key that was never written."
+      }
+    ],
+    "approach": "Keep an ordered history for each key. Binary search for the rightmost timestamp no greater than the query; a read must leave that history unchanged.",
+    "note": "Queries arrive in any order, so a cache holding only the newest value per key will answer some of them wrongly. Answer from the full history every time; a query for an older timestamp must never be served the current value."
+  },
+  "transactions": {
+    "overview": "Build a key-value store that lets callers group tentative changes into nested transactions. Inner work can be committed or discarded without ending the outer transaction.",
+    "task": "Implement `TransactionStore` with `get`, `set`, `delete`, `begin`, `commit`, and `rollback`.",
+    "requirements": [
+      "Values are strings. Missing reads return `None`; deleting a missing key is a no-op.",
+      "Reads see the latest changes in the current transaction.",
+      "`begin()` opens a nested transaction.",
+      "`commit()` merges only the innermost transaction into its parent. `rollback()` discards only the innermost transaction.",
+      "Calling `commit()` or `rollback()` with no active transaction raises `ValueError`."
+    ],
+    "examples": [
+      {
+        "code": "s = TransactionStore()\ns.set(\"x\", \"root\")\ns.begin()\ns.set(\"x\", \"outer\")\ns.begin()\ns.set(\"x\", \"inner\")\ns.commit()\nprint(s.get(\"x\"))\ns.rollback()\nprint(s.get(\"x\"))",
+        "output": "inner\nroot",
+        "explanation": "The inner commit merges into the outer scope. Rolling back the outer scope still restores the original value."
+      },
+      {
+        "code": "s = TransactionStore()\ns.delete(\"missing\")\nprint(s.get(\"missing\"))",
+        "output": "None",
+        "explanation": "Deleting a missing key does not create a value and does not raise an error."
+      }
+    ],
+    "approach": "Represent nested scopes explicitly. Reads use the latest visible state; commit combines only the top scope with its parent, while rollback discards only that scope.",
+    "note": "A nested `commit()` merges only the innermost scope into its parent, and a nested `rollback()` discards only that scope. Both leave everything outside the innermost scope exactly as it was."
+  },
+  "scheduler": {
+    "overview": "A build system must run prerequisites before the tasks that depend on them. Produce a deterministic order so repeated builds make the same choices.",
+    "task": "Implement `build_order(tasks, dependencies) -> list[str]`.",
+    "requirements": [
+      "Task names are unique strings. Each dependency is a `(prerequisite, dependent)` pair of existing tasks.",
+      "A task becomes runnable only after all its prerequisites have run.",
+      "Always choose the lexicographically smallest task among those currently runnable.",
+      "Duplicate dependency edges count once.",
+      "Raise `ValueError` if a cycle prevents a complete order."
+    ],
+    "examples": [
+      {
+        "code": "print(build_order([\"app\", \"db\", \"ui\"], [(\"db\", \"app\")]))",
+        "output": "['db', 'app', 'ui']",
+        "explanation": "The runnable tasks initially are db and ui. After db runs, app becomes runnable and is selected before ui."
+      },
+      {
+        "code": "print(build_order([], []))",
+        "output": "[]",
+        "explanation": "With no tasks there is nothing to schedule."
+      }
+    ],
+    "approach": "Use indegrees and a min-heap of runnable tasks. Deduplicate edges before counting indegrees. If fewer than all tasks are emitted, a cycle prevented completion.",
+    "note": "Count each dependency edge once. If the same pair appears twice and you increment the indegree twice, the dependent never reaches zero and a perfectly valid graph is reported as a cycle."
+  },
+  "merge": {
+    "overview": "Events arrive in individually sorted streams from several shards. Merge them into one timeline without letting the event payload change tie-breaking.",
+    "task": "Implement `merge_events(streams) -> list[tuple]`.",
+    "requirements": [
+      "Each stream contains `(timestamp, payload)` events sorted by timestamp.",
+      "Return all events in one sorted list.",
+      "For equal timestamps, lower stream indices come first; ties within a stream retain their original order.",
+      "Payload strings must never determine event ordering.",
+      "Aim for `O(N log k)` time for `N` events across `k` streams."
+    ],
+    "examples": [
+      {
+        "code": "print(merge_events([[(1, \"z\"), (3, \"x\")], [(1, \"a\"), (2, \"b\")]]))",
+        "output": "[(1, 'z'), (1, 'a'), (2, 'b'), (3, 'x')]",
+        "explanation": "Both first events have timestamp 1; the event from stream 0 comes first even though its payload sorts later."
+      },
+      {
+        "code": "print(merge_events([[], [(2, \"only\")], []]))",
+        "output": "[(2, 'only')]",
+        "explanation": "Empty streams contribute no events."
+      }
+    ],
+    "approach": "Put the next event from each stream in a heap keyed by timestamp, stream index, and position. Emit the smallest and replace it with the next event from the same stream.",
+    "note": "Order by timestamp first and stream index second. Two events sharing a timestamp must keep their shard order, so the payload must never enter the comparison key."
+  },
+  "paths": {
+    "overview": "Resolve a path as a shell would, using a supplied working directory. This is string processing only: do not inspect files or follow symbolic links.",
+    "task": "Implement `resolve_path(cwd, path) -> str`.",
+    "requirements": [
+      "`cwd` is an absolute canonical POSIX path.",
+      "An absolute `path` ignores `cwd`. An empty `path` returns `cwd`.",
+      "Collapse repeated slashes, ignore `.` components, and process `..` without going above root.",
+      "Do not access the filesystem or resolve symbolic links."
+    ],
+    "examples": [
+      {
+        "code": "print(resolve_path(\"/home/user\", \"../logs/./today\"))",
+        "output": "/home/logs/today",
+        "explanation": "The parent component removes user; dot leaves the current path unchanged."
+      },
+      {
+        "code": "print(resolve_path(\"/a/b\", \"/../../x//\"))",
+        "output": "/x",
+        "explanation": "An absolute path ignores the working directory. Parent traversal cannot go above root."
+      }
+    ],
+    "approach": "Use a stack of path components. Start from cwd for relative paths and from root for absolute paths; ignore empty/dot components and pop for parent components.",
+    "note": "`..` at the root is not an error. Popping from an empty component stack has to be ignored, or a path that walks above the root raises instead of clamping to `/`."
+  },
+  "intervals": {
+    "overview": "Maintenance windows may overlap or touch. Combine them into the smallest sorted set of windows that covers exactly the same time.",
+    "task": "Implement `merge_windows(windows) -> list[list[int]]`.",
+    "requirements": [
+      "Intervals use integer endpoints and are half-open: `[start, end)`, with `start < end`.",
+      "Merge intervals that overlap or touch.",
+      "Return sorted merged intervals as lists.",
+      "Do not modify the input."
+    ],
+    "examples": [
+      {
+        "code": "print(merge_windows([[5, 8], [1, 3], [3, 6]]))",
+        "output": "[[1, 8]]",
+        "explanation": "Touching windows merge too, so all three become one continuous window."
+      },
+      {
+        "code": "windows = [[4, 5], [1, 2]]\nprint(merge_windows(windows))\nprint(windows)",
+        "output": "[[1, 2], [4, 5]]\n[[4, 5], [1, 2]]",
+        "explanation": "The result is sorted, but the caller’s input must keep its original order."
+      }
+    ],
+    "approach": "Sort a copy by start time. Extend the latest merged window when the next start is at or before its end; otherwise append a new window.",
+    "note": "Touching windows merge. A window ending exactly where the next one begins shares no instant with it, so merge when `start <= end` and not only when the two genuinely overlap."
+  },
+  "peak": {
+    "overview": "Requests occupy a service from their start time until their end time. Find the largest number that are active simultaneously.",
+    "task": "Implement `peak_concurrency(intervals) -> int`.",
+    "requirements": [
+      "Intervals are half-open `[start, end)` with `start <= end`.",
+      "Ignore zero-length intervals.",
+      "A request ending at time `t` does not overlap one starting at time `t`.",
+      "Return the maximum number active at any time."
+    ],
+    "examples": [
+      {
+        "code": "print(peak_concurrency([[0, 4], [1, 3], [3, 5]]))",
+        "output": "2",
+        "explanation": "At time 3, one request ends as another begins. Those two requests do not overlap."
+      },
+      {
+        "code": "print(peak_concurrency([[2, 2], [4, 4]]))",
+        "output": "0",
+        "explanation": "Zero-length requests occupy no time and do not contribute to the peak."
+      }
+    ],
+    "approach": "Sweep through start and end events, handling ends before starts at the same timestamp. Track both current active requests and the maximum seen so far.",
+    "note": "A request ending at time `t` and one starting at time `t` do not overlap. Apply the end before the start at a shared timestamp, or that instant is counted twice and the peak comes out one too high."
+  },
+  "bfs": {
+    "overview": "Services call other services through a directed graph. Find the fewest edges needed to reach a target from a source.",
+    "task": "Implement `shortest_route(graph, source, target) -> int`.",
+    "requirements": [
+      "The graph is directed and maps service names to neighbor lists.",
+      "A node missing as a graph key has no outgoing edges.",
+      "Return the minimum number of edges from source to target, or `-1` if unreachable.",
+      "If source equals target, return `0`."
+    ],
+    "examples": [
+      {
+        "code": "print(shortest_route({\"a\": [\"b\", \"c\"], \"b\": [\"d\"], \"c\": [\"d\"]}, \"a\", \"d\"))",
+        "output": "2",
+        "explanation": "Either route a → b → d or a → c → d uses two hops."
+      },
+      {
+        "code": "print(shortest_route({}, \"a\", \"b\"))\nprint(shortest_route({}, \"a\", \"a\"))",
+        "output": "-1\n0",
+        "explanation": "A missing source has no outgoing edges, but a node is zero hops from itself."
+      }
+    ],
+    "approach": "Breadth-first search visits nodes in increasing hop count. Mark each node when enqueuing it so cycles and duplicate neighbors do not create duplicate work.",
+    "note": "A node that never appears as a key in the graph has no outgoing edges. Reach it with a lookup that tolerates absence rather than a direct index, or the search raises the moment it arrives at a leaf."
+  },
+  "trie": {
+    "overview": "Create autocomplete for a command palette. Users repeatedly ask for the first few words with a prefix, so avoid scanning the entire vocabulary for every query.",
+    "task": "Implement `Autocomplete.add(word)` and `suggest(prefix, k) -> list[str]`.",
+    "requirements": [
+      "Added words use lowercase ASCII letters. Duplicate additions are allowed.",
+      "Return at most `k` distinct matching words in lexicographic order.",
+      "An empty prefix matches all words.",
+      "Return `[]` when `k <= 0`. Design for repeated prefix queries."
+    ],
+    "examples": [
+      {
+        "code": "a = Autocomplete()\nfor word in [\"cat\", \"car\", \"cart\", \"cat\"]:\n    a.add(word)\nprint(a.suggest(\"ca\", 3))",
+        "output": "['car', 'cart', 'cat']",
+        "explanation": "Duplicate insertions do not duplicate suggestions; results are in lexical order."
+      },
+      {
+        "code": "a = Autocomplete()\na.add(\"a\")\nprint(a.suggest(\"\", 5))\nprint(a.suggest(\"a\", 0))",
+        "output": "['a']\n[]",
+        "explanation": "An empty prefix matches all words. A nonpositive limit requests no suggestions."
+      }
+    ],
+    "approach": "Walk a trie to the prefix node, then traverse child letters in sorted order. Emit terminal words once and stop as soon as k suggestions have been found.",
+    "note": "A prefix can reach the same word by more than one path through the trie, and it must still come back once. Deduplicate on the way out, and return nothing at all when `k` is zero or less."
+  },
+  "dp": {
+    "overview": "A tokenizer can use several known strings, each with a cost. Split the entire input into tokens while minimizing the total cost, rather than greedily choosing the longest token.",
+    "task": "Implement `min_token_cost(text, costs) -> int`.",
+    "requirements": [
+      "`costs` maps nonempty token strings to nonnegative integer costs.",
+      "Cover all of `text` with known tokens; tokens may be reused.",
+      "Return the minimum total cost, or `-1` if no complete segmentation exists.",
+      "Empty text costs `0`."
+    ],
+    "examples": [
+      {
+        "code": "print(min_token_cost(\"aaaa\", {\"a\": 2, \"aa\": 1, \"aaa\": 3}))",
+        "output": "2",
+        "explanation": "Two aa tokens cost 2, which is cheaper than choosing aaa followed by a."
+      },
+      {
+        "code": "print(min_token_cost(\"ab\", {\"a\": 0}))\nprint(min_token_cost(\"\", {}))",
+        "output": "-1\n0",
+        "explanation": "An uncovered suffix makes the task impossible. Empty text needs no tokens."
+      }
+    ],
+    "approach": "Dynamic programming stores the cheapest cost for each reachable prefix. Try every matching token from each reachable position and relax the endpoint cost.",
+    "note": "An empty text costs `0` with no tokens, and a text that cannot be segmented costs `-1`. Both are base cases of the same dynamic program, and an unreachable marker that is merely very large turns an impossible segment into a plausible cost."
+  },
+  "backtrack": {
+    "overview": "Assign indivisible jobs to workers with fixed capacities. Total free capacity alone is not enough: each job must fit entirely on one worker.",
+    "task": "Implement `can_assign(jobs, capacities) -> bool`.",
+    "requirements": [
+      "Each job must be assigned wholly to one worker. A worker’s total load cannot exceed its capacity.",
+      "Jobs and capacities are nonnegative integers.",
+      "Empty jobs succeed, even with no workers.",
+      "Target at most 12 jobs and 6 workers.",
+      "Do not modify either input."
+    ],
+    "examples": [
+      {
+        "code": "print(can_assign([4, 3, 3, 2], [6, 6]))",
+        "output": "True",
+        "explanation": "One worker can take 4 + 2 and the other can take 3 + 3."
+      },
+      {
+        "code": "print(can_assign([3, 3, 3], [5, 4]))",
+        "output": "False",
+        "explanation": "Total capacity is 9, but neither worker can take two jobs of size 3."
+      }
+    ],
+    "approach": "Place large jobs first and backtrack over workers with enough remaining capacity. Skip equivalent capacity choices to avoid exploring symmetric assignments.",
+    "note": "A job cannot be split across workers, and the number being minimised is the single busiest worker, not the average and not the total. Those are different objectives and only the maximum is being asked for."
+  },
+  "dedupe": {
+    "overview": "Usage events may be delivered more than once. Aggregate account totals while ensuring that an event ID is charged at most once across all accounts.",
+    "task": "Implement `aggregate_events(events) -> dict`.",
+    "requirements": [
+      "Every event contains `id`, `account`, and an integer `amount`.",
+      "The first occurrence of an ID wins globally, even if a later duplicate changes the account or amount.",
+      "Return each accepted account’s total amount.",
+      "Negative and zero amounts are valid."
+    ],
+    "examples": [
+      {
+        "code": "events = [{\"id\": \"x\", \"account\": \"a\", \"amount\": 5},\n          {\"id\": \"x\", \"account\": \"b\", \"amount\": 9},\n          {\"id\": \"y\", \"account\": \"a\", \"amount\": -2}]\nprint(aggregate_events(events))",
+        "output": "{'a': 3}",
+        "explanation": "The first x wins globally. Its later duplicate cannot add a charge to b; y reduces a’s total."
+      },
+      {
+        "code": "print(aggregate_events([]))",
+        "output": "{}",
+        "explanation": "No accepted events means no accounts in the result."
+      }
+    ],
+    "approach": "Keep a global set of seen IDs and a per-account total. Check and record identity before adding the amount, including when the amount is zero or negative.",
+    "note": "The first occurrence of an id wins outright. A later duplicate carrying a different account or a different amount is ignored completely rather than merged, or the same event is counted twice under two accounts."
+  },
+  "window": {
+    "overview": "Find the longest uninterrupted span of activity that uses only a small number of event types. The order and contiguity of events matter.",
+    "task": "Implement `longest_activity(events, k) -> int`.",
+    "requirements": [
+      "Events are string types in an ordered sequence.",
+      "The chosen span must be contiguous and contain at most `k` distinct types.",
+      "Return its length, not the span itself.",
+      "If `k <= 0`, return `0`."
+    ],
+    "examples": [
+      {
+        "code": "print(longest_activity([\"a\", \"b\", \"a\", \"c\", \"c\"], 2))",
+        "output": "3",
+        "explanation": "The span a, c, c at the end and a, b, a at the beginning both have length 3."
+      },
+      {
+        "code": "print(longest_activity([\"a\", \"a\"], 0))",
+        "output": "0",
+        "explanation": "With no distinct types allowed, only the empty span is valid."
+      }
+    ],
+    "approach": "Maintain a sliding window and a frequency map. Expand the right edge, then shrink from the left until the number of distinct types is within the limit.",
+    "note": "The span has to be contiguous. The `k` most frequent events overall are not the same as a window containing `k` distinct types, and only the contiguous one is being asked for."
+  },
+  "parser": {
+    "overview": "Network reads may stop in the middle of a message. Build a decoder that remembers incomplete headers and payloads until later chunks arrive.",
+    "task": "Implement `Decoder.feed(chunk) -> list[str]` for frames encoded as `length:payload`.",
+    "requirements": [
+      "Frames use the ASCII format `decimal_length:payload`. Empty payloads are valid.",
+      "A length has no leading zeros unless it is exactly `0`.",
+      "Input is a valid stream; a chunk may split either a header or a payload.",
+      "Each `feed()` returns only the complete payloads newly decoded by that call. Retain incomplete data for later calls."
+    ],
+    "examples": [
+      {
+        "code": "d = Decoder()\nprint(d.feed(\"3:a\"))\nprint(d.feed(\"bc0:1:x\"))",
+        "output": "[]\n['abc', '', 'x']",
+        "explanation": "The first chunk contains only part of a three-character payload. The second finishes it and supplies two more complete frames."
+      },
+      {
+        "code": "d = Decoder()\nprint(d.feed(\"3:a:b\"))",
+        "output": "['a:b']",
+        "explanation": "A colon inside the payload is ordinary data; only the declared length determines the payload boundary."
+      }
+    ],
+    "approach": "Keep separate header and payload states. Parse the length only after the separator, then consume exactly that many characters before starting another frame.",
+    "note": "A chunk boundary can fall anywhere, including in the middle of a length header or in the middle of a payload. Carry the partial state across `feed` calls instead of assuming each chunk is a whole number of frames."
+  },
+  "debug": {
+    "overview": "A retry helper is silently dropping errors and repeating successful operations. Repair the supplied implementation while preserving its public interface.",
+    "task": "Implement `retry(operation, attempts, retry_on=(TimeoutError,))`.",
+    "requirements": [
+      "`attempts` is the total number of allowed calls, not the number of extra retries. Raise `ValueError` if it is less than 1.",
+      "Return immediately on success, including `None`, `0`, `False`, and empty strings.",
+      "Retry only exception types included in `retry_on`.",
+      "If the budget is exhausted, re-raise the last retryable exception. Other exceptions propagate immediately."
+    ],
+    "examples": [
+      {
+        "code": "calls = []\ndef operation():\n    calls.append(1)\n    return False\nprint(retry(operation, 3))\nprint(len(calls))",
+        "output": "False\n1",
+        "explanation": "False is a successful return value. It must not trigger another call."
+      },
+      {
+        "code": "calls = []\ndef operation():\n    calls.append(1)\n    if len(calls) < 2:\n        raise TimeoutError(\"try again\")\n    return \"ok\"\nprint(retry(operation, 2))\nprint(len(calls))",
+        "output": "ok\n2",
+        "explanation": "The first retryable failure uses one attempt; the second call succeeds."
+      }
+    ],
+    "approach": "Validate the attempt count, return immediately from any successful call, catch only the configured exception types, and re-raise the final retryable failure.",
+    "note": "A successful call can return `None`, `0`, `False` or an empty string, and all four are successes. Test whether the call itself failed, not whether the result is truthy, or a legitimate result gets reported as a failure and retried."
+  },
+  "async": {
+    "overview": "Run asynchronous operations concurrently without overwhelming a downstream service. Return results in input order even when completion order differs.",
+    "task": "Implement `async bounded_map(items, fn, limit) -> list`.",
+    "requirements": [
+      "Have at most `limit` active calls to the asynchronous function.",
+      "Return results in input order, not completion order.",
+      "Raise `ValueError` when `limit < 1`.",
+      "On failure, cancel and await unfinished work before propagating the error.",
+      "Use `asyncio`, without native threads. Top-level `await` is supported in this lab."
+    ],
+    "examples": [
+      {
+        "code": "import asyncio\nasync def double(x):\n    await asyncio.sleep(0)\n    return x * 2\nprint(await bounded_map([3, 1, 2], double, 2))",
+        "output": "[6, 2, 4]",
+        "explanation": "At most two calls may be active, while result positions still correspond to the input."
+      },
+      {
+        "code": "async def identity(x):\n    return x\nprint(await bounded_map([], identity, 1))",
+        "output": "[]",
+        "explanation": "An empty input completes with an empty result."
+      }
+    ],
+    "approach": "Use a semaphore to cap active calls and preserve result positions. On failure, cancel unfinished tasks and await their cleanup before propagating the error.",
+    "note": "Results come back in input order, never completion order. Two coroutines can finish in either order, so anything that simply appends a result as it completes returns them in whatever order they happened to finish."
+  },
+  "credits": {
+    "overview": "An account receives credit grants with different expiration times. Spending should use the credits that would expire first and must never partially consume an unaffordable purchase.",
+    "task": "Implement `CreditLedger.grant(amount, now, ttl)`, `spend(amount, now)`, and `balance(now)`.",
+    "requirements": [
+      "Grants have nonnegative integer amounts and positive TTLs. A grant expires at `now + ttl`, exclusively.",
+      "Operations use globally nondecreasing timestamps. Spend amounts are nonnegative.",
+      "If funds are insufficient, return `False` without consuming any live credit.",
+      "Otherwise consume the earliest-expiring credits first and return `True`.",
+      "`balance(now)` counts only credits still live at that time."
+    ],
+    "examples": [
+      {
+        "code": "s = CreditLedger()\ns.grant(3, 0, 2)\ns.grant(5, 0, 10)\nprint(s.spend(3, 1))\nprint(s.balance(2))",
+        "output": "True\n5",
+        "explanation": "The spend uses the three soonest-expiring credits, preserving all five longer-lived credits."
+      },
+      {
+        "code": "s = CreditLedger()\ns.grant(4, 0, 5)\nprint(s.spend(5, 1))\nprint(s.balance(1))",
+        "output": "False\n4",
+        "explanation": "An insufficient balance rejects the spend without consuming any credit."
+      }
+    ],
+    "approach": "Expire grants first. Check the full live balance before spending, then consume grants in expiration order; failed spends must leave all live grants unchanged.",
+    "note": "A spend larger than the live balance is refused and consumes nothing at all. Taking the available credit and only then discovering you are short leaves the ledger permanently drained by a spend that never happened."
+  },
+  "topk": {
+    "overview": "Summarize an error log by its most frequent distinct messages. Equal-frequency errors need deterministic ordering.",
+    "task": "Implement `top_errors(errors, k) -> list[str]`.",
+    "requirements": [
+      "Return distinct error strings ordered by descending frequency, then ascending lexicographic order.",
+      "Return at most `k` errors; `k` may exceed the number of distinct strings.",
+      "Return `[]` when `k <= 0`."
+    ],
+    "examples": [
+      {
+        "code": "print(top_errors([\"z\", \"a\", \"z\", \"a\", \"b\"], 2))",
+        "output": "['a', 'z']",
+        "explanation": "a and z both appear twice, so lexical order puts a first."
+      },
+      {
+        "code": "print(top_errors([\"x\"], 10))\nprint(top_errors([\"x\"], 0))",
+        "output": "['x']\n[]",
+        "explanation": "The result cannot contain more distinct errors than exist; a nonpositive k returns no errors."
+      }
+    ],
+    "approach": "Count frequencies, then select by descending count and ascending error string. A full sort is straightforward; a bounded heap can help when k is much smaller than the vocabulary.",
+    "note": "The result is a list of distinct strings, not of events. Count each event once and then order by descending frequency, breaking ties lexicographically so the same data always produces the same output."
+  },
+  "search": {
+    "overview": "Build a small document index for AND queries. Replacing a document must remove words that no longer appear in that document.",
+    "task": "Implement `SearchIndex.add(doc_id, text)` and `search(query) -> list[int]`.",
+    "requirements": [
+      "Document IDs are integers. Adding an existing ID replaces its content.",
+      "Tokenize both documents and queries using `text.lower().split()`. Keep punctuation.",
+      "Return sorted IDs containing every query token. Repeated query tokens add no extra requirement.",
+      "An empty query returns `[]`."
+    ],
+    "examples": [
+      {
+        "code": "s = SearchIndex()\ns.add(2, \"Red blue\")\ns.add(1, \"red green\")\nprint(s.search(\"RED\"))\nprint(s.search(\"red blue\"))",
+        "output": "[1, 2]\n[2]",
+        "explanation": "Matching is case-insensitive and results are sorted. An AND query requires every query word."
+      },
+      {
+        "code": "s = SearchIndex()\ns.add(1, \"old\")\ns.add(1, \"new\")\nprint(s.search(\"old\"))",
+        "output": "[]",
+        "explanation": "A replacement must remove stale postings for the old content."
+      }
+    ],
+    "approach": "Map tokens to document ID sets and track the tokens for each document. Remove old memberships on replacement, then intersect posting sets for all query tokens.",
+    "note": "Tokenise with `text.lower().split()` and keep the punctuation. Splitting on word characters quietly drops symbols that documents and queries both still contain, and the two tokenisations stop agreeing."
+  },
+  "weighted": {
+    "overview": "Network links have different latencies. Find the minimum total latency along a directed route, which may use more hops than another route.",
+    "task": "Implement `min_latency(graph, source, target) -> int`.",
+    "requirements": [
+      "The directed graph maps nodes to `(neighbor, latency)` edges with nonnegative integer latencies.",
+      "A missing node has no outgoing edges.",
+      "Return the minimum total latency or `-1` if unreachable.",
+      "If source equals target, return `0`. Zero-weight edges are valid."
+    ],
+    "examples": [
+      {
+        "code": "graph = {\"a\": [(\"t\", 10), (\"b\", 1)], \"b\": [(\"t\", 2)]}\nprint(min_latency(graph, \"a\", \"t\"))",
+        "output": "3",
+        "explanation": "Going through b costs 3, less than the direct link’s cost of 10."
+      },
+      {
+        "code": "print(min_latency({}, \"a\", \"a\"))\nprint(min_latency({}, \"a\", \"b\"))",
+        "output": "0\n-1",
+        "explanation": "A node has zero latency to itself. An unreachable target returns -1."
+      }
+    ],
+    "approach": "Use Dijkstra’s algorithm with a min-heap and best-known distances. Skip stale heap entries; nonnegative weights ensure a finalized shortest distance cannot later improve.",
+    "note": "Zero-weight edges are allowed here. Relax with a strict improvement, `candidate < current`, rather than `<=`, or an equal-cost route through a zero-weight edge can relax forever and never settle."
+  },
+  "rle": {
+    "overview": "Consume values from a run-length encoded stream without expanding it. A run count can be enormous, so work in runs rather than individual values.",
+    "task": "Implement `RLEIterator(runs)` and `next(n) -> int`.",
+    "requirements": [
+      "Runs are `(count, value)` pairs with nonnegative integer counts and values.",
+      "Each call has `n >= 1`. Consume `n` values and return the last consumed value.",
+      "If fewer than `n` remain, consume the remainder and return `-1`.",
+      "Do not expand the run-length encoding into individual values."
+    ],
+    "examples": [
+      {
+        "code": "r = RLEIterator([(3, 8), (0, 9), (2, 5)])\nprint(r.next(2))\nprint(r.next(2))\nprint(r.next(2))",
+        "output": "8\n5\n-1",
+        "explanation": "The second call crosses a run boundary and ends on 5. The last call consumes the one remaining value but returns -1 because it needed two."
+      },
+      {
+        "code": "r = RLEIterator([(1000000000000, 7)])\nprint(r.next(1000000000000))",
+        "output": "7",
+        "explanation": "A trillion repeated values can be consumed by adjusting a count, without allocating a trillion elements."
+      }
+    ],
+    "approach": "Maintain a run index and the remaining count in that run. Subtract whole runs until the requested consumption fits; return -1 after exhausting an insufficient remainder.",
+    "note": "Never expand a run into its individual values. The counts can be enormous, so a loop per value is the difference between a solution that finishes and one that does not. Consume in run-sized steps and track how much of the current run is left."
+  },
+  "ttl:followup": {
+    "overview": "The store now has to do more than expire values. It must support deleting one key, scanning a prefix in sorted order, and moving its entire contents elsewhere and back, including into a different store at a later time, without resurrecting entries that had already expired.",
+    "task": "Build an `AdvancedTTLStore` that keeps the whole base contract and adds the seven methods below.",
+    "requirements": [
+      "`get(key, now)` behaves exactly as in the base problem: a missing key and an expired key both return `None`.",
+      "`delete(key, now)` removes the key and returns `True` if it was present and still live, `False` otherwise. Deleting the same key twice returns `False` the second time.",
+      "`scan(prefix, now)` returns every live key starting with `prefix` as a list of `(key, value)` tuples, sorted by key. Expired keys never appear.",
+      "`snapshot(now)` returns a dict of `key: (value, remaining_ttl)` that is independent of the live store: changing either side afterwards must not change the other.",
+      "A `remaining_ttl` of `None` means the entry never expires.",
+      "`restore(snapshot, now)` replaces the entire contents of the store. A finite `remaining_ttl` of `d` becomes a fresh lifetime expiring at `now + d`.",
+      "`purge(now)` drops every expired key and returns how many it removed.",
+      "As in the base problem: `ttl=0` is already expired when written, values are strings, and the `now` you are given never decreases."
+    ],
+    "examples": [
+      {
+        "code": "s = AdvancedTTLStore()\ns.set(\"app:a\", \"v\", 10, ttl=5)\nsnapshot = s.snapshot(12)\ns.restore(snapshot, 100)\nprint(s.scan(\"app:\", 102))\nprint(s.get(\"app:a\", 103))",
+        "output": "[('app:a', 'v')]\nNone",
+        "explanation": "At time 12 the value has 3 units of life left, so that is what the snapshot records. Restoring at time 100 rebases the expiration to 103, which is why the key is still visible at 102 and gone at 103."
+      }
+    ],
+    "approach": "Everything except one idea is the base problem plus a sweep. The idea is that `snapshot` and `restore` pull in opposite directions: a snapshot has to record **remaining** lifetime rather than the absolute expiry the store holds, because the snapshot may be restored at a completely different time. `restore` then rebases that remaining lifetime onto the restore time. Two traps follow. First, do not alias. Handing back the live value objects means a later write through the snapshot would mutate the store, so rebuild the records. Second, sweep before you observe: `scan` and `snapshot` must not report keys that have already expired, or a restore will bring them back from the dead.",
+    "note": "Snapshot remaining lifetime, not absolute expiry. A value expiring at 15, snapshotted at 12, has 3 units left. Restoring it at 100 must expire it at 103, not at 15.",
+    "interface": [
+      "AdvancedTTLStore()",
+      "AdvancedTTLStore.set(key, value, now, ttl=None)",
+      "AdvancedTTLStore.purge(now)",
+      "AdvancedTTLStore.get(key, now)",
+      "AdvancedTTLStore.delete(key, now)",
+      "AdvancedTTLStore.scan(prefix, now)",
+      "AdvancedTTLStore.snapshot(now)",
+      "AdvancedTTLStore.restore(snapshot, now)"
+    ]
+  },
+  "limiter:followup": {
+    "overview": "The sliding window is strict, but it has a sharp edge: a client that has just used its whole quota is rejected until the window slides, even if capacity is sitting idle. This stage asks for two different ways of smoothing the same traffic, so you can see exactly where they disagree.",
+    "task": "Build a `WeightedLimiter` that charges a per-request cost instead of one request per slot, and a `TokenBucket` that refills continuously. They are deliberately different designs and the tests pin down where the two disagree.",
+    "requirements": [
+      "`WeightedLimiter(policies)` where `policies` maps each client to a `(limit, window)` pair. Both numbers are positive.",
+      "`allow(client, now, weight=1)` returns `True` to accept or `False` to reject. Only an accepted request charges quota, and it charges its full `weight`.",
+      "Quota is charged over the same half-open window `(now - window, now]` as the base problem. `weight` is a positive integer.",
+      "An unknown client raises `KeyError`. A `weight` of zero or less raises `ValueError`.",
+      "`TokenBucket(capacity, refill_per_second)` starts completely full at time 0.",
+      "`TokenBucket.allow(now, weight=1)` refills continuously at the given rate, capped at `capacity`, and charges only accepted requests. A nonpositive `weight` raises `ValueError` here too.",
+      "The `now` you are given never decreases."
+    ],
+    "examples": [
+      {
+        "code": "r = WeightedLimiter({\"a\": (3, 5)})\nprint(r.allow(\"a\", 0, 2))\nprint(r.allow(\"a\", 1, 2))\nprint(r.allow(\"a\", 5, 3))",
+        "output": "True\nFalse\nTrue",
+        "explanation": "The rejected weight is not charged. At time 5 the weight accepted at time 0 has expired."
+      }
+    ],
+    "approach": "The two designs differ in exactly one respect, and being able to name it is the point of this stage. The window remembers each accepted request individually and forgets them all at once, so it is strict. The bucket remembers only a total and refills it smoothly, so it lets a client burst right after it has spent everything. That is why a window can reject a client the bucket would admit, and why the bucket can admit a client that just used its whole quota. Charge quota only on acceptance in both. Spending on a rejected request is the mistake that quietly turns a limiter into a rate randomiser, because the client is throttled for calls it never actually made.",
+    "interface": [
+      "WeightedLimiter(policies)",
+      "WeightedLimiter.allow(client, now, weight=1)",
+      "TokenBucket(capacity, refill_per_second)",
+      "TokenBucket.allow(now, weight=1)"
+    ],
+    "note": "Only accepted requests consume quota. A rejected request must leave the window and the bucket exactly as they were, or a client is throttled for calls it never made."
+  },
+  "lru:followup": {
+    "overview": "Counting entries is the wrong unit for a response cache: one entry might be 2 KB and the next 20 MB. This stage budgets by bytes, expires entries on their own clock, and takes away the data structure that would otherwise do the recency bookkeeping for you.",
+    "task": "Build an `AdvancedLRU` cache that evicts by byte budget rather than entry count, expires entries by time, and maintains recency with a doubly linked list you write yourself.",
+    "requirements": [
+      "`get(key, now)` returns the value, or `-1` when the key is absent or has expired.",
+      "`put(key, value, size, now, ttl=None)` returns `True` when the value was stored and `False` when it was refused.",
+      "`size` is the entry's explicit, nonnegative byte cost. An entry larger than the entire budget is refused with `False`.",
+      "Refusing an oversized entry must not disturb what is already stored under that key.",
+      "Entries expire on their own clock, and expiry is exclusive: an entry written with `ttl=0` is already expired the moment it is written.",
+      "Expired entries are reclaimed before any operation, including keys nobody ever reads again.",
+      "A read that succeeds, and every accepted write, marks that key as most recently used.",
+      "Writing a key that is already present replaces its value and size instead of adding a second entry.",
+      "Recency must come from a doubly linked list you implement yourself. `OrderedDict` and similar structures are not allowed.",
+      "`capacity_bytes` is nonnegative, and a budget of zero stores nothing."
+    ],
+    "examples": [
+      {
+        "code": "c = AdvancedLRU(3)\nprint(c.put(\"a\", 10, 2, 0))\nprint(c.put(\"a\", 20, 4, 1))\nprint(c.get(\"a\", 1))",
+        "output": "True\nFalse\n10",
+        "explanation": "An oversized replacement is rejected and preserves the existing cached value."
+      }
+    ],
+    "approach": "Keep a map from key to node, and a linked list ordered oldest to newest. The map gives you lookup, the list gives you eviction order, and each node needs to know its neighbours so a hit can unlink and re-append in constant time instead of searching. The eviction rule is where this gets interesting: budget is consumed by size, so evicting a single entry may free enough room for the incoming one or may not, and you have to keep evicting until it fits or the cache is empty. Expiry is the other trap, and it is the one that punishes a linked list. You might assume the oldest entry in the list is the one that expires first, but entries have independent TTLs, so the newest entry can expire before the oldest. Sweeping a map on each operation is much easier to get right than trying to prune the list in expiry order.",
+    "interface": [
+      "Node(key=None, value=None, size=0, expiry=None)",
+      "AdvancedLRU(capacity_bytes)",
+      "AdvancedLRU.get(key, now)",
+      "AdvancedLRU.put(key, value, size, now, ttl=None)"
+    ],
+    "note": "An oversized entry is refused without disturbing the key it was meant to overwrite: `put` returns `False` and the previous value is still readable."
+  },
+  "temporal:followup": {
+    "overview": "Configuration history grows without bound, and in practice most of the old versions are worthless. This stage lets writes arrive out of order, lets you compact the history, and lets you pin a timestamp you still need answered so that compaction cannot throw it away.",
+    "task": "Build a `History` that accepts out-of-order writes, can compact old versions, and keeps every pinned timestamp answerable.",
+    "requirements": [
+      "`set(key, value, timestamp)` and `get(key, timestamp)` behave as in the base problem, except that writes no longer arrive in increasing order.",
+      "Writing the same key at a timestamp that already exists overwrites that version rather than adding a second one at the same time.",
+      "`pin(timestamp)` marks a timestamp that must survive compaction, and `unpin(timestamp)` releases it.",
+      "`compact(cutoff)` discards old versions. Afterwards, a query at or after `cutoff`, and a query at any pinned timestamp, must still return exactly what it would have returned before.",
+      "A query strictly before `cutoff`, at a timestamp that is not pinned, is no longer guaranteed to be answered correctly.",
+      "To keep the rule above true, compaction retains every version at or after `cutoff`, plus the newest version at or before `cutoff`, plus the newest version at or before each pinned timestamp.",
+      "`version_count(key)` reports how many versions of that key are currently stored.",
+      "`pin` is only ever called before the compaction that would affect it."
+    ],
+    "examples": [
+      {
+        "code": "h = History()\nh.set(\"x\", \"old\", 1)\nh.set(\"x\", \"new\", 5)\nh.pin(1)\nh.compact(5)\nprint(h.get(\"x\", 1))\nprint(h.get(\"x\", 5))",
+        "output": "old\nnew",
+        "explanation": "The pinned old value and the value at the cutoff must both remain queryable."
+      }
+    ],
+    "approach": "Sorting on write is what buys you everything else. Once each key's history is a sorted list, compaction is a single left-to-right pass that keeps a version for each reason it is still needed: everything inside the retained range, one boundary version below the cutoff, and one boundary version below each pin. The subtlety is that a pinned timestamp needs the newest version at or before it, not the version written at it. A pin almost always falls in a gap where no write happened, so looking for an exact match finds nothing and you would drop a version that was still needed.",
+    "interface": [
+      "History()",
+      "History.set(key, value, timestamp)",
+      "History.get(key, timestamp)",
+      "History.pin(timestamp)",
+      "History.unpin(timestamp)",
+      "History.compact(cutoff)",
+      "History.version_count(key)"
+    ],
+    "note": "Compaction keeps the newest version at or before each pinned timestamp, not the version written at that timestamp. A pin usually lands in a gap where no write occurred."
+  },
+  "transactions:followup": {
+    "overview": "A read-heavy workload sometimes needs to know how many keys currently hold a given value, and scanning the whole keyspace to count them is too slow to do on every call. This stage keeps those counts correct across nested commits and rollbacks.",
+    "task": "Build a `CountStore` with the whole base contract plus a `count(value)` query that answers in constant time on average.",
+    "requirements": [
+      "`get`, `set`, `delete`, `begin`, `commit` and `rollback` behave exactly as in the base problem, including nesting and the `ValueError` on an unmatched commit or rollback.",
+      "`count(value)` returns how many currently visible keys hold that value. A key is counted once, however many times it was written.",
+      "`count` must be `O(1)` on average. Do not scan the keys to answer it.",
+      "A key that has been deleted, or that only ever existed inside a transaction that was rolled back, does not count.",
+      "After every commit and every rollback the counts must agree exactly with what a full scan of the visible keys would produce.",
+      "Values are strings, and counting a value that is not present returns `0`."
+    ],
+    "examples": [
+      {
+        "code": "s = CountStore()\ns.set(\"a\", \"blue\")\ns.set(\"b\", \"blue\")\ns.begin()\ns.delete(\"a\")\nprint(s.count(\"blue\"))\ns.rollback()\nprint(s.count(\"blue\"))",
+        "output": "1\n2",
+        "explanation": "Deleting inside a transaction changes the visible count. Rolling back restores it."
+      }
+    ],
+    "approach": "The counts are a second index over the same state, so the only real question is when to adjust them. Updating on every `set` and `delete` is not enough on its own, because a commit replays a whole transaction at once and a rollback throws one away wholesale. Keep the running totals per scope, apply them when a scope commits, and discard them when it rolls back. Shadowing is the case that catches people. A transaction that overwrites a key has to move the count from the value the key already held to the new one, and a delete has to decrement the value it was actually holding rather than the one being written, which means you need the previous value to hand.",
+    "interface": [
+      "CountStore()",
+      "CountStore.get(key)",
+      "CountStore.count(value)",
+      "CountStore.set(key, value)",
+      "CountStore.delete(key)",
+      "CountStore.begin()",
+      "CountStore.commit()",
+      "CountStore.rollback()"
+    ],
+    "note": "Counts must survive a rollback. A key that only ever existed inside a rolled-back transaction never counted, and it must not start counting once that transaction is discarded."
+  },
+  "scheduler:followup": {
+    "overview": "Ordering tasks is only half of a build system. The other half is running them on a fixed pool of workers as soon as their prerequisites finish, and deciding what happens in the instant when several things complete at once.",
+    "task": "Simulate the build on a fixed pool of workers and return when every task starts and ends.",
+    "requirements": [
+      "`schedule(tasks, dependencies, workers)` returns a dict mapping each task to its `(start, end)` times.",
+      "`tasks` maps unique names to nonnegative durations, and every dependency names two existing tasks as `(prerequisite, dependent)`.",
+      "A task may only start once every prerequisite has finished and a worker is free.",
+      "At each event time, finish every task whose end time is that moment, then start ready tasks in lexicographic order until no worker is free.",
+      "A task of duration `0` still occupies its moment: it starts and finishes at the same time, and can unlock its dependents immediately.",
+      "Duplicate edges between the same pair count once.",
+      "Raise `ValueError` when `workers` is less than 1, or when a dependency cycle makes a complete schedule impossible."
+    ],
+    "examples": [
+      {
+        "code": "print(schedule({\"a\": 2, \"b\": 1, \"c\": 3}, [(\"a\", \"c\")], 2))",
+        "output": "{'a': (0, 2), 'b': (0, 1), 'c': (2, 5)}",
+        "explanation": "a and b start together. c waits for a, then starts at time 2."
+      }
+    ],
+    "approach": "Run this as a simulation over event times rather than a loop over tasks, because two tasks can finish at the same instant and the order you resolve them in changes who gets a worker. Keep running tasks in a min-heap keyed by end time, and keep ready tasks in a min-heap keyed by name so the lexicographic rule falls out for free instead of being a sort you have to remember. The rule to get right is the ordering inside a single instant: finish everything that ends now before starting anything, otherwise a zero-duration task sits idle for a whole timestep and can deadlock a dependent that was ready to go at that very moment.",
+    "interface": ["schedule(tasks, dependencies, workers)"],
+    "note": "Finish every task ending at a given time before starting any task at that time. Otherwise a zero-duration task and its dependent can deadlock on the same instant."
+  },
+  "merge:followup": {
+    "overview": "A streaming system cannot hold everything in memory, and it cannot safely emit an event until it knows no earlier one is still on its way. This stage adds a merge that reads lazily, and the buffering discipline that makes a lazy merge safe to emit from.",
+    "task": "Merge sorted streams without materialising them, and build a buffer that only releases events once a watermark says they are ready.",
+    "requirements": [
+      "`merge_lazy(streams)` returns an iterator over the events of every stream in one order: by timestamp, then by stream index for equal timestamps. The inputs are iterables and must not be materialised.",
+      "`WatermarkBuffer(max_events)` starts with no watermark, that is, with negative infinity.",
+      "`add(event)` buffers an event and returns `None`. It raises `ValueError` if the event's timestamp is at or below the current watermark, or if accepting it would move the watermark backwards.",
+      "`add` raises `OverflowError` when the buffer is already full.",
+      "An `add` that raises leaves the buffer and the watermark exactly as they were.",
+      "`advance(watermark)` returns every buffered event with a timestamp at or below the watermark, sorted by timestamp with arrival order breaking ties, and records the new watermark.",
+      "Watermarks never decrease. Advancing to an earlier watermark raises `ValueError` and changes nothing.",
+      "Both parts use the same event shape as the base problem, a `(timestamp, payload)` tuple."
+    ],
+    "examples": [
+      {
+        "code": "b = WatermarkBuffer(3)\nb.add((3, \"late\"))\nb.add((1, \"early\"))\nprint(b.advance(1))\nprint(b.advance(3))",
+        "output": "[(1, 'early')]\n[(3, 'late')]",
+        "explanation": "Only events at or below the new watermark are released; the others remain buffered."
+      }
+    ],
+    "approach": "The lazy merge is the heap from the base problem with the finished list replaced by a generator, which is the whole point: nothing is pulled from a stream until it has to be. The buffer is the more interesting half, because it is where a lazy merge becomes safe to emit from. An event can only be released once the watermark proves no stream can still produce something earlier, so the invariant is that `add` may never accept an event at or below the watermark, and `advance` may never move it backwards. Enforcing both on the way in is what keeps the order of released events stable; accepting something you cannot retract is how a stream ends up emitting an event it already promised was complete.",
+    "interface": [
+      "merge_lazy(streams)",
+      "WatermarkBuffer(max_events)",
+      "WatermarkBuffer.add(event)",
+      "WatermarkBuffer.advance(watermark)"
+    ],
+    "note": "An `add` that raises must leave the buffer unchanged, watermark included. A half-applied rejection is how a stream emits an event it already claimed was complete."
+  },
+  "paths:followup": {
+    "overview": "A path resolver is only safe if it cannot be tricked. This stage adds symbolic links, which breaks naive resolvers twice: a link can point outside the root, and it can point back inside, so a path that leaves and returns must still be rejected.",
+    "task": "Resolve a path against a working directory inside a restricted root, expanding symbolic links as you go and refusing anything that leaves the root.",
+    "requirements": [
+      "`secure_resolve(root, cwd, path, links)` returns a canonical absolute path. `root` and `cwd` are canonical and absolute, and `cwd` must be inside `root`.",
+      "`links` maps the canonical absolute path of a symbolic link to its target, which may itself be absolute or relative.",
+      "A relative target is resolved against the directory containing the link, not against `cwd`.",
+      "Links are expanded as each component is traversed, so a link is followed even when the path walks out and back through `..`.",
+      "Raise `ValueError` if the traversal would leave `root`, and `ValueError` if a single resolution expands more than 40 links.",
+      "An absolute `path` must begin with exactly the `root` components. A sibling directory that merely shares a prefix does not count as being inside.",
+      "Nothing here touches the filesystem. `links` is the entire world."
+    ],
+    "examples": [
+      {
+        "code": "print(secure_resolve(\"/root\", \"/root\", \"link/..\", {\"/root/link\": \"dir/child\"}))",
+        "output": "/root/dir",
+        "explanation": "Expand link to dir/child before processing the following parent component."
+      }
+    ],
+    "approach": "Resolve component by component against a stack, exactly as in the base problem, with one addition: after each component, compute the absolute path so far and check it against `links` before moving on. Checking once at the end is not enough, because a path can leave the root through one link and come back through another, and only the final answer would look legal. The ordering matters too. Expand a link when you traverse its component, before applying a later `..`, because `..` applies to where you actually are rather than to the path you typed. And bound the hop count, because a cycle of links is otherwise an infinite loop rather than an error.",
+    "interface": ["secure_resolve(root, cwd, path, links)"],
+    "note": "Reject the escape even when the path comes back inside. A traversal that leaves through one link and returns through another is a rejected traversal, not a legal one."
+  },
+  "intervals:followup": {
+    "overview": "Merging windows is easy when they only ever get added. Real schedules get cancelled, and removing part of a window leaves you with the two pieces on either side of the hole. This stage keeps a changing set of covered time and can report where the gaps are.",
+    "task": "Maintain a set of covered windows that supports adding and removing coverage, and report both the covered set and its gaps.",
+    "requirements": [
+      "`add(start, end)` unions the new window into the covered set.",
+      "`remove(start, end)` subtracts the window from the covered set, including when it covers only part of an existing window.",
+      "`windows()` returns the covered set as sorted, disjoint, merged lists. Touching windows are merged. The result is a copy, so mutating it cannot corrupt the set.",
+      "`gaps(start, end)` returns the uncovered intervals inside the half-open range `[start, end)`.",
+      "All intervals are half-open, and `start < end` always.",
+      "Removing a window that is not covered changes nothing."
+    ],
+    "examples": [
+      {
+        "code": "s = WindowSet()\ns.add(0, 10)\ns.remove(3, 7)\nprint(s.windows())\nprint(s.gaps(0, 10))",
+        "output": "[[0, 3], [7, 10]]\n[[3, 7]]",
+        "explanation": "Removing the middle splits the covered interval into two pieces and exposes one gap."
+      }
+    ],
+    "approach": "Both operations reduce to the same primitive, and the reason they are cheap is the invariant: after every change the covered set is sorted, disjoint and non-touching, so a new interval can overlap at most one existing window on each side. `add` then extends or merges those neighbours, and `remove` splits a single window into up to two. Reporting gaps comes almost free once that invariant holds, because you walk the covered windows in order and whatever is left between two of them, before the first, and after the last is uncovered. Trying to answer `gaps` by subtracting from the query range directly, without that walk, is where most of the bugs are.",
+    "interface": [
+      "WindowSet()",
+      "WindowSet.windows()",
+      "WindowSet.add(start, end)",
+      "WindowSet.remove(start, end)",
+      "WindowSet.gaps(start, end)"
+    ],
+    "note": "`remove` can split one window into two. The pieces on either side of the hole are still covered, and `windows()` has to report both."
+  },
+  "peak:followup": {
+    "overview": "Reporting the peak is the easy half. Reporting where the peak happened is the harder half, and it is the half that shows whether you understood the sweep rather than guessed at it. This stage asks for every stretch of time at which the maximum was reached.",
+    "task": "Track concurrency as completed intervals are added, and report both the peak and every range during which it held.",
+    "requirements": [
+      "`add(start, end)` records one completed, half-open interval. Intervals are nonnegative in length and may arrive in any order.",
+      "`report()` returns `(peak, ranges)`, where `peak` is the highest number of overlapping intervals at any point and `ranges` is the sorted list of positive-length ranges during which that peak is reached.",
+      "Zero-length intervals are ignored entirely. They overlap nothing and must never appear in `ranges`.",
+      "Ranges that merely touch are merged, so two peak stretches back to back are reported as one.",
+      "`report()` is an exact snapshot of everything added so far, not a prediction of what future intervals will do.",
+      "An empty tracker reports `(0, [])`."
+    ],
+    "examples": [
+      {
+        "code": "s = PeakTracker()\ns.add(0, 4)\ns.add(1, 3)\nprint(s.report())",
+        "output": "(2, [[1, 3]])",
+        "explanation": "Two requests are active throughout the half-open range [1, 3)."
+      }
+    ],
+    "approach": "The peak itself is a sweep: turn every interval into a plus at its start and a minus at its end, sort the events, and walk the running count. The ranges fall out of that same walk instead of needing a second pass. While sweeping, note the moments where the count rises to a new maximum and where it falls back below it, and the maxima are exactly the stretches in between. Two details decide whether the answer is right. Ties matter: at a shared endpoint the end has to be processed before the start, or a zero-length overlap inflates the peak. And the ranges must be discarded and rebuilt whenever the peak rises, because everything you recorded against an older maximum is no longer a maximum.",
+    "interface": [
+      "PeakTracker()",
+      "PeakTracker.add(start, end)",
+      "PeakTracker.report()"
+    ],
+    "note": "Zero-length intervals overlap nothing. A request that arrives and completes at the same instant must not count towards the peak, and must not appear in the ranges."
+  },
+  "bfs:followup": {
+    "overview": "The base problem returns a distance. This stage returns the route itself, and pins down which route to return when several share the minimum hop count, so the answer is reproducible instead of depending on dictionary iteration order.",
+    "task": "Return an actual minimum-hop route through a directed graph, and make the choice deterministic when several shortest paths exist.",
+    "requirements": [
+      "`route(graph, source, target)` returns the list of nodes along a minimum-hop path, or `[]` when the target is unreachable.",
+      "The graph is a dict from a node to its list of outgoing neighbours. A node that is not a key has no outgoing edges.",
+      "When several paths share the minimum hop count, return the one this problem defines as first: expand neighbours in lexicographic order and take the first path that reaches the target.",
+      "Nodes are strings, and a neighbour may repeat without being pruned, so a path is allowed to revisit a node.",
+      "`route(graph, x, x)` returns `[x]`.",
+      "The graph is not modified."
+    ],
+    "examples": [
+      {
+        "code": "print(route({\"a\": [\"c\", \"b\"], \"b\": [\"t\"], \"c\": [\"t\"]}, \"a\", \"t\"))",
+        "output": "['a', 'b', 't']",
+        "explanation": "Sorting the neighbors visits b before c, selecting a → b → t."
+      }
+    ],
+    "approach": "Breadth-first search already gives you the minimum hop count, because it expands in layers. To make the choice deterministic, make the queue order deterministic: expand neighbours in sorted order, and mark a node visited the moment you enqueue it. That single detail is what stops a node being claimed by a longer path that happened to be enqueued first, and it is why sorting at the end does not work. Recovering the route needs a parent pointer recorded at enqueue time, then a walk back from the target. Keep the direction straight: the search runs forward from the source, so the parent chain points back toward it.",
+    "interface": ["route(graph, source, target)"],
+    "note": "Mark a node visited when you enqueue it, not when you dequeue it. Marking late lets a longer path claim the node first and changes which of two equal-length routes you return."
+  },
+  "trie:followup": {
+    "overview": "Autocomplete has to rank, and it has to treat two spellings of the same word as one entry. This stage adds frequency, deletion, and Unicode normalisation, which is exactly where the phrase 'the same word' stops being obvious.",
+    "task": "Build a ranked autocomplete that normalises equivalent spellings, accumulates their frequency, and can delete a word.",
+    "requirements": [
+      "`add(word, count=1)` records that the word has been used, adding `count` to its running total. `count` is positive.",
+      "`delete(word)` removes the whole word and its accumulated frequency, returning `True` if it was present and `False` if it was not.",
+      "`suggest(prefix, k)` returns at most `k` normalised words, sorted by descending frequency and then by the normalised word in ascending order.",
+      "Normalise every word as NFC, then casefold, then NFC again. Equivalent spellings accumulate into a single entry.",
+      "`suggest` returns the normalised form of each word, not whichever spelling happened to be added first.",
+      "`k` of zero or less returns `[]`."
+    ],
+    "examples": [
+      {
+        "code": "a = RankedAutocomplete()\na.add(\"Straße\", 2)\na.add(\"STRASSE\", 3)\na.add(\"street\", 4)\nprint(a.suggest(\"str\", 3))",
+        "output": "['strasse', 'street']",
+        "explanation": "Both spellings of Straße normalize to strasse; their counts combine to five."
+      }
+    ],
+    "approach": "Normalise on the way in and never store the raw spelling, because two spellings of the same word have to be indistinguishable afterwards. The second NFC in the pipeline is not decoration: casefolding can decompose a character, so without re-normalising afterwards the same word would be filed under two different keys. A trie keyed on normalised characters gives you prefix lookup for free, but the frequency belongs to the terminal node rather than to the whole subtree, so carrying the count down as you walk is simpler than maintaining counts at every node. Make the sort total, frequency first and then the word, so a tie can never depend on insertion order.",
+    "interface": [
+      "RankedAutocomplete()",
+      "RankedAutocomplete.add(word, count=1)",
+      "RankedAutocomplete.delete(word)",
+      "RankedAutocomplete.suggest(prefix, k)"
+    ],
+    "note": "Normalise on the way in and store only the normalised form. Two spellings of the same word must collapse to one entry, and `suggest` must return the normalised spelling rather than whichever arrived first."
+  },
+  "dp:followup": {
+    "overview": "The base problem returns a cost. Returning the actual segmentation makes it much harder, because several segmentations can share the minimum cost and you now have to choose between them on something other than the number.",
+    "task": "Return both the minimum cost and the token sequence that achieves it, breaking ties on the sequence itself.",
+    "requirements": [
+      "`token_plan(text, costs)` returns `(minimum_cost, tokens)`: the total cost, and the list of token strings that produce `text`.",
+      "Segment `text` into nonempty tokens that appear in `costs`. Tokens may be reused, and costs are nonnegative integers.",
+      "A `text` that cannot be segmented returns `(-1, [])`. An empty `text` returns `(0, [])`.",
+      "When several segmentations share the minimum cost, return the one whose complete token list is lexicographically smallest. The comparison is on the whole list, not on any single token.",
+      "Use a trie to discover the candidate tokens starting at each position.",
+      "Return the exact token strings, not positions or lengths."
+    ],
+    "examples": [
+      {
+        "code": "print(token_plan(\"aaaa\", {\"a\": 1, \"aa\": 2}))",
+        "output": "(4, ['a', 'a', 'a', 'a'])",
+        "explanation": "All segmentations cost four. The list beginning with the smaller token a wins the tie."
+      }
+    ],
+    "approach": "The cost is the usual bottom-up dynamic program over prefixes, and the temptation is to carry the token list along with it. Resist that: comparing two whole lists at every position is quadratic in the worst case, and it is where this attempt usually falls over. Keep only the cost at each position, then walk the text once from the left and at each step choose the smallest token that still reaches an optimal cost from there. That second pass is linear, and it hands you the lexicographic tie-break for free, because greedily taking the smallest token that does not lose optimality is exactly the definition of the smallest feasible list.",
+    "interface": ["token_plan(text, costs)"],
+    "note": "Tie-break on the complete token list, not on a single token. Picking the locally cheapest token at each step can produce a segmentation that is not the lexicographically smallest among the optimal ones."
+  },
+  "backtrack:followup": {
+    "overview": "Partitioning work is easy when the input is sorted and every part has to stay contiguous. This stage asks for an assignment to a fixed number of workers where only the single busiest worker matters, which is a different and much harder objective.",
+    "task": "Assign jobs to a fixed number of workers so that the busiest worker ends up as light as possible, and report both the makespan and the assignment.",
+    "requirements": [
+      "`balance_jobs(jobs, workers)` returns `(makespan, assignment)`, where `assignment[i]` is the index of the worker given job `i` in its original position.",
+      "`jobs` is a list of positive integers. `workers` is at least 1, otherwise raise `ValueError`.",
+      "The makespan is the largest total load across all workers, and the returned assignment must achieve the minimum possible makespan.",
+      "Any assignment with the optimal makespan is accepted, so ties between equally good assignments do not need breaking.",
+      "There are at most 12 jobs and 6 workers.",
+      "The input list is not modified.",
+      "No jobs returns `(0, [])`."
+    ],
+    "examples": [
+      {
+        "code": "jobs = [4, 3, 3, 2]\nmakespan, assignment = balance_jobs(jobs, 2)\nprint(makespan)\nprint(sorted(sum(job for job, owner in zip(jobs, assignment) if owner == worker) for worker in range(2)))",
+        "output": "6\n[6, 6]",
+        "explanation": "An optimal assignment gives each worker total load six. Worker indices may differ between valid solutions."
+      }
+    ],
+    "approach": "This is the classic makespan problem, and at this size the search space is small enough to take the direct route. Sort the jobs descending and hand each one to the least loaded worker, which gets you a good answer immediately, then try to do better. The trap is stopping there. The greedy split is usually optimal but not always, and a solution that simply returns it will fail exactly on the cases where a heavy job would have been better placed on a lighter worker. Search with jobs committed in sorted order and prune on a lower bound for the remaining load: that finds the true optimum while staying fast at these limits.",
+    "interface": ["balance_jobs(jobs, workers)"],
+    "note": "Any optimal assignment is accepted, but the greedy split is not always optimal. Sorting descending and filling the least loaded worker gives a good answer, not a guaranteed one, so the result still has to be proved optimal."
+  },
+  "dedupe:followup": {
+    "overview": "Deduplication is a memory leak if you never expire anything, but expiry has to remove the record of what you have seen without touching what you have already counted. This stage separates those two lifetimes on purpose.",
+    "task": "Aggregate amounts per account exactly once per event id, then let the deduplication records expire on their own schedule.",
+    "requirements": [
+      "`EventTotals(retention).accept(id, account, amount, now)` returns `True` the first time an id is seen and `False` for a duplicate. Only an accepted event adds to a total.",
+      "`total(account)` returns the running total for that account, and `0` for one that has never been accepted.",
+      "An id is deduplicated until `now >= first_time + retention`. Past that point the same id may be accepted again, and it adds to the total a second time.",
+      "A rejected duplicate must not extend the expiration of that record. Only an accepted event sets or refreshes the window.",
+      "`live_ids(now)` reports how many deduplication records are currently retained, so you can check memory.",
+      "Expiring a record removes only the memory of the id. Totals already accumulated are never reduced.",
+      "`retention` is positive, and the `now` you are given never decreases."
+    ],
+    "examples": [
+      {
+        "code": "s = EventTotals(5)\nprint(s.accept(\"x\", \"a\", 3, 0))\nprint(s.accept(\"x\", \"a\", 3, 4))\nprint(s.accept(\"x\", \"a\", 3, 5))\nprint(s.total(\"a\"))",
+        "output": "True\nFalse\nTrue\n6",
+        "explanation": "The duplicate at time 4 does not renew the retention window. At time 5 the ID can be accepted again."
+      }
+    ],
+    "approach": "Keep two structures that age differently, and that separation is the whole design: a map from account to total that is never pruned, and a map from id to the time it was first accepted that is. Conflating them is what makes this feel harder than it is. The subtle rule is that a duplicate does not refresh the record. If it did, a client retrying in a loop would keep its own id alive forever and the retention window would never reclaim anything, which is the opposite of what it is for. Prune inside the operations you already have rather than running a background sweep, because nothing ever tells you when time advances.",
+    "interface": [
+      "EventTotals(retention)",
+      "EventTotals.accept(id, account, amount, now)",
+      "EventTotals.total(account)",
+      "EventTotals.live_ids(now)"
+    ],
+    "note": "A rejected duplicate must not refresh the expiration window. If it did, a client retrying on a loop would hold its own id alive forever and the retention window would never clear anything."
+  },
+  "window:followup": {
+    "overview": "Counting distinct values in a moving window is one problem. Finding the best window anywhere in the data is a different one that reuses the same sliding technique, and both need their tie-breaking rules written down rather than assumed.",
+    "task": "Find the longest span holding at most a given number of distinct values, and maintain running counts over a window of time.",
+    "requirements": [
+      "`longest_span(events, k)` returns `(start, end)`, the longest contiguous span of `events` containing at most `k` distinct values. `end` is exclusive.",
+      "When two spans are equally long, return the one with the smallest start.",
+      "`k` of zero or less returns `(0, 0)`, and so does an empty input.",
+      "`TimeWindow(window).add(kind, now)` records one event of that kind at that time.",
+      "`counts(now)` returns a dict of the kinds seen in the half-open window `(now - window, now]`, including kinds whose count has fallen to zero. The returned dict is a copy.",
+      "Two events at the same timestamp count separately.",
+      "The `now` you are given never decreases, and `window` is positive."
+    ],
+    "examples": [
+      {
+        "code": "print(longest_span([\"a\", \"b\", \"a\", \"c\"], 2))\nw = TimeWindow(5)\nw.add(\"a\", 0)\nw.add(\"b\", 1)\nprint(w.counts(5))",
+        "output": "(0, 3)\n{'b': 1}",
+        "explanation": "The longest valid span ends before index 3. At time 5, the event at time 0 is outside the rolling window."
+      }
+    ],
+    "approach": "Both parts are the same sliding window seen from two directions. For the span, advance the right edge and grow the left edge until the window holds at most `k` distinct values, recording the best span as you go. The rule that catches people is what happens when a value's count drops to zero: that value has left the window, which can make the window valid again without the right edge moving at all. Record the candidate span before you shrink, not after, or the answer comes out consistently one event too short. For the time window the same structure keyed on time rather than index, with the same discipline: drop from the left until the oldest event falls outside the half-open range.",
+    "interface": [
+      "longest_span(events, k)",
+      "TimeWindow(window)",
+      "TimeWindow.add(kind, now)",
+      "TimeWindow.counts(now)"
+    ],
+    "note": "When the left edge shrinks because a value dropped to zero, the window can grow again without the right edge moving. Record the span before shrinking, or the answer is one event too short."
+  },
+  "parser:followup": {
+    "overview": "Streaming decoders fail in a specific way: once the input is malformed, carrying on produces plausible-looking garbage that is much harder to debug than an outright error. This stage makes the decoder fail loudly and stay failed.",
+    "task": "Decode length-prefixed frames from a stream, and turn every malformed input into a permanent, explicit failure.",
+    "requirements": [
+      "`SafeDecoder(max_frame).feed(chunk)` returns the payloads of every frame this chunk completes, and `finish()` returns `None`.",
+      "A frame is a length header of decimal digits, then a colon, then exactly that many bytes of ASCII payload.",
+      "A length header contains decimal digits only, with no leading zeros unless it is exactly `0`.",
+      "Raise `ValueError` as soon as the input is decidably invalid rather than waiting for more bytes: non-ASCII input, a malformed header, or a length greater than `max_frame`.",
+      "`finish()` raises `ValueError` if a partial header or a partial payload is still buffered, because that frame can never complete.",
+      "After any error the decoder is failed, and every later call to `feed` or `finish` raises `ValueError`.",
+      "Parsing state is kept across chunks, and a large payload is not repeatedly re-concatenated as it arrives. `max_frame` is nonnegative."
+    ],
+    "examples": [
+      {
+        "code": "d = SafeDecoder(3)\nprint(d.feed(\"0:3:a:\"))\nprint(d.feed(\"b\"))\nd.finish()",
+        "output": "['']\n['a:b']",
+        "explanation": "The first frame is empty. The second has the three-character payload a:b, completed by the next chunk."
+      }
+    ],
+    "approach": "Keep a buffer with a read offset, and only concatenate when the offset has drifted far enough from the end to be worth reclaiming, which keeps parsing linear on a large body instead of quadratic. Validate each header character as it arrives, because that is what lets you reject a bad frame the moment it becomes decidable rather than after buffering a megabyte of payload. The state machine is the interesting part: a single failed flag checked at the top of every public method is all it takes to make the decoder permanently failed, and it matters because a caller that keeps feeding a broken stream must not be able to make the decoder start working again.",
+    "interface": [
+      "SafeDecoder(max_frame)",
+      "SafeDecoder.feed(chunk)",
+      "SafeDecoder.finish()"
+    ],
+    "note": "Once the decoder has raised, it stays failed. Every later `feed` and `finish` raises too, because a stream that has already produced nonsense cannot be trusted again."
+  },
+  "debug:followup": {
+    "overview": "Retrying without a deadline is how a small dependency problem turns into an outage. This stage adds exponential backoff and a hard deadline, and injects the clock so the behaviour can be tested without real delays.",
+    "task": "Retry an operation with exponential backoff under a deadline, with time and randomness supplied by the caller.",
+    "requirements": [
+      "`retry_deadline(operation, attempts, base_delay, deadline, clock, sleep, jitter)` returns the result of `operation` once it succeeds.",
+      "Only `TimeoutError` is retried. Every other exception propagates immediately.",
+      "`attempts` below 1 raises `ValueError`.",
+      "Before each attempt, check that `clock() < deadline`, and raise `TimeoutError('deadline')` if it is not.",
+      "After the failure numbered `i` counting from 0, the delay is `max(0, base_delay * 2 ** i + jitter(i))`.",
+      "If `clock() + delay >= deadline`, raise `TimeoutError('deadline')` without sleeping, because the wait could not help.",
+      "When the final attempt fails with a retryable error, re-raise that original error rather than a deadline error.",
+      "A call that succeeds after the deadline still returns normally. The deadline bounds waiting, not work already in progress.",
+      "`clock`, `sleep` and `jitter` are injected, so nothing really sleeps and the result is deterministic. `jitter(i)` returns an additive offset."
+    ],
+    "examples": [
+      {
+        "code": "now = [0]\ncalls = []\ndef clock(): return now[0]\ndef sleep(delay): now[0] += delay\ndef operation():\n    calls.append(1)\n    if len(calls) == 1: raise TimeoutError(\"retry\")\n    return \"ok\"\nprint(retry_deadline(operation, 3, 2, 10, clock, sleep, lambda i: 0))\nprint(now[0])",
+        "output": "ok\n2",
+        "explanation": "After the first failure, the injected sleep advances time by two. The next attempt succeeds before the deadline."
+      }
+    ],
+    "approach": "The shape is a loop with the deadline checked in two places, and the two checks do different jobs. The one before an attempt stops you starting work that could not finish in time. The one before sleeping stops you waiting when the wait itself would cross the deadline, which saves a pointless pause and is why a caller still fails fast when its budget is nearly gone. Keep the last real error in a variable so the final re-raise reports what actually went wrong, and remember that the deadline is only ever consulted between operations, never during one, because there is no safe way to interrupt an operation already in flight.",
+    "interface": [
+      "retry_deadline(operation, attempts, base_delay, deadline, clock, sleep, jitter)"
+    ],
+    "note": "The last retryable failure re-raises the original exception, not a deadline error. The candidate needs to see why the operation kept failing, and a deadline error hides it."
+  },
+  "async:followup": {
+    "overview": "Async code has a default that is wrong for a server: one task per item. A large iterable becomes an unbounded number of tasks and unbounded memory. This stage bounds the work in flight instead of the work in total.",
+    "task": "Map an async function over a synchronous iterable using a fixed number of workers, without materialising the input or creating a task per item.",
+    "requirements": [
+      "`await pool_map(items, fn, limit, timeout=None)` returns the results in input order. `items` is a synchronous iterable and `fn` is async.",
+      "At most `limit` worker tasks exist at once, and no per-item tasks are created when `timeout` is `None`.",
+      "A new item is pulled from the iterable only when a worker is ready for it. The iterable is never materialised up front.",
+      "When `timeout` is given, it applies to each individual call of `fn`.",
+      "`limit` below 1 is rejected.",
+      "If `fn` raises, or the caller is cancelled, every outstanding worker is cancelled and then awaited before the error propagates.",
+      "An empty input returns `[]`.",
+      "This bounds work in flight, not total output. The result list still grows with the number of items."
+    ],
+    "examples": [
+      {
+        "code": "import asyncio\nasync def double(x):\n    await asyncio.sleep(0)\n    return x * 2\nprint(await pool_map(iter([3, 1, 2]), double, 2))",
+        "output": "[6, 2, 4]",
+        "explanation": "Workers may complete in a different order, but results still match the original input order."
+      }
+    ],
+    "approach": "Use a small pool of long-lived workers pulling from a shared iterator, rather than a task per item, and that is the entire point of the exercise. Two subtleties, both about not leaking work. First, `asyncio.gather` does not stop the remaining tasks when one raises, so on failure or cancellation you must cancel what is left and then await it; cancelling without awaiting leaves work running after you have returned. Second, because the input is a plain iterator, a worker that raises partway through must not be restarted from scratch, or the next worker re-reads from a position nobody recorded and results are silently duplicated or dropped. Order comes from writing each result into a pre-sized list at the index the item was pulled from, not from completion order.",
+    "interface": ["await pool_map(items, fn, limit, timeout=None)"],
+    "note": "Cancelling workers without awaiting them is the leak that matters. On an error or a cancellation, every outstanding task must be cancelled and then awaited before the exception escapes."
+  },
+  "credits:followup": {
+    "overview": "A ledger is supposed to answer questions about the past, which is uncomfortable when events arrive late. A grant that lands out of order can retroactively change whether an earlier spend was accepted, so answering a query means replaying rather than trusting an incremental total.",
+    "task": "Answer balance and spend-outcome questions about a credit ledger whose events can arrive out of order, including ones that arrive long after the time they describe.",
+    "requirements": [
+      "`HistoricalLedger` provides `grant(id, amount, time, ttl)`, `spend(id, amount, time)`, `balance(query_time)` and `accepted(spend_id, query_time)`.",
+      "Ids are globally unique across grants and spends, amounts are nonnegative integers, and `ttl` is positive.",
+      "Events may arrive in any order. When replaying, order them by event time, then grants before spends at the same time, then by id ascending.",
+      "At each event, first expire any grants whose expiry is at or before that event's time.",
+      "A spend consumes the earliest expiring grants first, and among grants that expire together, the lowest id.",
+      "A spend larger than the available balance is refused and consumes nothing at all.",
+      "`accepted(spend_id, query_time)` reports whether that spend succeeded as of `query_time`, or `None` if the spend had not happened by then or is unknown.",
+      "Inserting an event retroactively may change the outcome of an earlier spend.",
+      "A query reflects every event currently recorded, wherever in time it arrived."
+    ],
+    "examples": [
+      {
+        "code": "s = HistoricalLedger()\ns.spend(\"purchase\", 4, 2)\nprint(s.accepted(\"purchase\", 2))\ns.grant(\"grant\", 5, 0, 10)\nprint(s.accepted(\"purchase\", 2))\nprint(s.balance(2))",
+        "output": "False\nTrue\n1",
+        "explanation": "After the time-0 grant arrives, replay accepts the time-2 spend and leaves one credit."
+      }
+    ],
+    "approach": "Because events arrive late and can change earlier outcomes, the only safe way to answer is to replay. Keep the events in a list, sort them into the canonical order for the query, and walk them accumulating grants and consuming them as spends come up. The ordering rule is what makes the answer stable: a grant at the same instant as a spend has to be available to that spend, or the same events would produce two different ledgers depending on the order they happened to arrive in. Do not try to maintain a running total you can patch afterwards, because one retroactive grant invalidates every spend that was decided after it. `accepted` is the same replay, stopping once you have passed the spend you care about.",
+    "interface": [
+      "HistoricalLedger()",
+      "HistoricalLedger.grant(id, amount, time, ttl)",
+      "HistoricalLedger.spend(id, amount, time)",
+      "HistoricalLedger.balance(query_time)",
+      "HistoricalLedger.accepted(spend_id, query_time)"
+    ],
+    "note": "A spend that cannot be covered consumes nothing. Taking the earliest grants and only then discovering you are still short would leave the ledger permanently short by that spend."
+  },
+  "topk:followup": {
+    "overview": "Exact top-k over a window is easy for as long as you can keep every event. Once memory is the constraint you need a sketch that is allowed to be wrong, and the useful part is being precise about which way it is wrong.",
+    "task": "Report the most frequent errors in a rolling window exactly, and separately build a bounded-memory heavy-hitter sketch whose counts are explicitly approximate.",
+    "requirements": [
+      "`WindowErrors(window).add(error, now)` records one error, and `top(k, now)` returns at most `k` error strings ordered by descending frequency and then ascending lexicographically, counting only the half-open window `(now - window, now]`.",
+      "The `now` you are given never decreases.",
+      "`HeavyHitters(capacity)` is a separate, bounded-memory sketch, and `capacity` is at least 1.",
+      "`add(error)` increments the counter for `error` if it is already a candidate; otherwise, if fewer than `capacity` keys are candidates, it inserts `error` with a count of 1.",
+      "If `error` is not a candidate and the sketch is full, decrement every counter by one and drop the keys that reach zero, without counting `error` itself.",
+      "`candidates()` returns a copy of the current counters.",
+      "Candidate counts are lower bounds on the true frequency. They are never exact, and never an overestimate."
+    ],
+    "examples": [
+      {
+        "code": "s = WindowErrors(5)\ns.add(\"z\", 0)\ns.add(\"a\", 0)\ns.add(\"z\", 1)\nprint(s.top(2, 1))\nprint(s.top(2, 5))",
+        "output": "['z', 'a']\n['z']",
+        "explanation": "At time 5 the two time-0 events have expired, leaving only the later z event."
+      }
+    ],
+    "approach": "The two halves trade accuracy for memory in opposite directions, and the sketch is the half worth thinking about. Keeping every candidate would be exact but grows without bound, so Misra-Gries spends accuracy to stay small: it holds at most `capacity` counters, and when an unseen item arrives at capacity it decrements everything and inserts nothing. That looks lossy, but a genuine heavy hitter appears far more often than `capacity` distinct items do, so it survives far more of those decrements than any rare item ever will, and it therefore always remains a candidate. The decrement step is the only subtle part: all counters must fall together and the zeros must be removed, or the sketch fills up with dead entries and forgets everything.",
+    "interface": [
+      "WindowErrors(window)",
+      "WindowErrors.add(error, now)",
+      "WindowErrors.top(k, now)",
+      "HeavyHitters(capacity)",
+      "HeavyHitters.add(error)",
+      "HeavyHitters.candidates()"
+    ],
+    "note": "When the sketch is full and an unseen error arrives, decrement every counter and insert nothing. Inserting the new item as well would let the sketch grow past its capacity, which is the one thing it exists to prevent."
+  },
+  "search:followup": {
+    "overview": "A single-term index is a lookup. Real queries are boolean: require all of these, any of these, none of these, or this exact phrase. The phrase query is the one that cannot be answered from term sets alone.",
+    "task": "Extend the document index with boolean and phrase queries, returning sorted document ids for each.",
+    "requirements": [
+      "`QueryIndex` provides `add(doc_id, text)`, `all_of(query)`, `any_of(query)`, `without(query)` and `phrase(query)`, each returning a sorted list of document ids.",
+      "Tokens are `text.lower().split()`, with punctuation kept.",
+      "`all_of` returns documents containing every token, `any_of` returns documents containing at least one, and `without` returns documents containing none.",
+      "`phrase` returns documents containing the tokens consecutively and in that order, including repeated words.",
+      "An empty `all_of`, `any_of` or `phrase` returns `[]`. An empty `without` returns every document.",
+      "Adding a document that already exists replaces its old content rather than merging into it."
+    ],
+    "examples": [
+      {
+        "code": "s = QueryIndex()\ns.add(2, \"a a b\")\ns.add(1, \"a b\")\nprint(s.phrase(\"a a\"))\nprint(s.without(\"b\"))",
+        "output": "[2]\n[]",
+        "explanation": "Only document 2 contains the repeated phrase. Both documents contain b, so neither survives exclusion."
+      }
+    ],
+    "approach": "The boolean queries fall out of set operations on postings lists, and intersecting the smallest list first keeps them cheap. Phrase queries are the real work, because a set intersection cannot see adjacency: a document holding the words `a` then `b` a thousand lines apart is not a match, and an intersection will cheerfully say it is. So you need positions per term, and a phrase is confirmed by walking the positions of the first token and checking that each later token sits at exactly the right offset from it. Starting from the rarest first token is what makes that fast in practice rather than merely correct.",
+    "interface": [
+      "QueryIndex()",
+      "QueryIndex.add(doc_id, text)",
+      "QueryIndex.all_of(query)",
+      "QueryIndex.any_of(query)",
+      "QueryIndex.without(query)",
+      "QueryIndex.phrase(query)"
+    ],
+    "note": "A phrase match needs consecutive positions, not just the presence of every word. Two tokens appearing far apart in a document are not a phrase, and a plain set intersection will report them as one."
+  },
+  "weighted:followup": {
+    "overview": "Single-source shortest path is a standard algorithm. Returning the route rather than the cost, and choosing between equal-cost routes, is what turns this into a problem about tie-breaking.",
+    "task": "Find the lowest-cost route to a target from any of several sources, and return the path using a defined tie-break.",
+    "requirements": [
+      "`best_route(graph, sources, target)` returns `(cost, path)`. `graph` maps a string node to a list of `(neighbor, weight)` pairs.",
+      "Choose the lowest total cost from any of the sources. `sources` may contain duplicates.",
+      "Every weight must be strictly positive, and a `ValueError` is raised if any weight is zero or negative anywhere in the graph, including in components you never traverse.",
+      "When several routes share the minimum cost, return the one whose entire node list is lexicographically smallest.",
+      "`target` being one of the sources returns `(0, [target])`.",
+      "Empty `sources`, or a target that is unreachable, returns `(-1, [])`."
+    ],
+    "examples": [
+      {
+        "code": "g = {\"s\": [(\"b\", 1), (\"a\", 1)], \"a\": [(\"t\", 1)], \"b\": [(\"t\", 1)]}\nprint(best_route(g, [\"s\"], \"t\"))",
+        "output": "(2, ['s', 'a', 't'])",
+        "explanation": "Both routes cost two; the complete path through a is lexicographically smaller."
+      }
+    ],
+    "approach": "Run Dijkstra once with every source seeded at distance zero, which gives the best cost from any of them. The tie-break is the interesting half, and the tempting approach of comparing whole paths whenever two costs tie does not survive, because a lexicographically smaller prefix can easily lead to a worse complete path. The robust way is to make the comparison part of the state: carry the node sequence in the priority queue key alongside the distance, so the queue always expands the smaller path first, and only settle a node once no later path can be both equal in cost and smaller. That argument needs strictly positive weights, which is why this contract rejects nonpositive ones rather than leaving you to handle zero-cost cycles yourself.",
+    "interface": ["best_route(graph, sources, target)"],
+    "note": "A weight of zero or negative is rejected anywhere in the graph, not only on the route you happen to take. Zero-weight edges are exactly what would make the lexicographic tie-break ambiguous, since a longer path could then tie a shorter one."
+  },
+  "rle:followup": {
+    "overview": "A compressed iterator only saves memory if it never expands what it is hiding. This stage keeps that property while adding filtering and a position you can return to, and that position has to mean the same thing whether or not a filter is active.",
+    "task": "Build a run-length iterator that can filter values, report its position, and be restored to it, all without expanding the runs.",
+    "requirements": [
+      "`ResumableRLE(runs, allowed=None)` iterates `(count, value)` runs of nonnegative count and value. `allowed` is `None`, meaning every value is permitted, or a collection of permitted values.",
+      "`next(n)` consumes the next `n` permitted values and returns the last of them, or `-1` once the rest of the stream is exhausted. `n` is at least 1.",
+      "Individual values are never expanded and no loop runs per value. Work is proportional to the runs crossed.",
+      "`snapshot()` returns `(run_index, offset)`, a position in the original run list rather than in the emitted stream.",
+      "`restore(snapshot)` returns to that position, for the same runs and the same filter. Snapshots are opaque to callers.",
+      "A run whose value is filtered out is skipped lazily, and skipping it must not change what a position means."
+    ],
+    "examples": [
+      {
+        "code": "s = ResumableRLE([(3, 2), (4, 9)], allowed={2})\nprint(s.next(2))\ncheckpoint = s.snapshot()\nprint(s.next(1))\ns.restore(checkpoint)\nprint(s.next(1))",
+        "output": "2\n2\n2",
+        "explanation": "Restoring the snapshot repeats consumption from the same position. The run of 9s is excluded by the filter."
+      }
+    ],
+    "approach": "A run is either wholly permitted or wholly filtered, so filtering never splits one, and that is what lets you stay proportional to runs instead of values. Keep an index into the run list plus an offset into the current run, and skip forward over filtered runs without materialising anything. The subtlety is what a position means. A snapshot has to point into the original runs, because the caller has no idea which runs were filtered out and could not reconstruct the position otherwise; a position in the emitted stream would be useless the moment a filter is in play. Copying the runs on construction matters for the same reason, so that restoring a snapshot still means the same thing after the caller has gone and mutated the list.",
+    "interface": [
+      "ResumableRLE(runs, allowed=None)",
+      "ResumableRLE.snapshot()",
+      "ResumableRLE.restore(snapshot)",
+      "ResumableRLE.next(n)"
+    ],
+    "note": "A snapshot is a position in the original run list, not in the stream you have emitted. With a filter in play those are different things, and only the first one can be restored."
+  },
+  "nodes": {
+    "overview": "A cluster of nodes learns its own size by exchanging messages over a link that reorders nothing and guarantees nothing: it may duplicate a message, lose it, or deliver it long after it was sent. The interesting part is the harness, because an asynchronous protocol is only testable when something owns the message order, the loss, and the definition of done.",
+    "task": "Implement the `Node` and `Channel` classes, `component_sizes`, and `run(net, node_ids, adjacency, rounds)`.",
+    "requirements": [
+      "`Node.known` maps a node id to the set of ids that node has advertised, and starts as `{self: {self}}`. A node learns nothing except by merging a payload.",
+      "`Node.merge(payload)` unions the payload in per key and returns the number of ids that were genuinely new. An id advertised by two neighbours is still one node.",
+      "`Node.count()` is O(1), because the union of `known` is maintained by `merge` rather than recomputed on demand.",
+      "`Node.converged(truth)` reports whether `count()` equals `truth[node_id]`. Convergence is measured against ground truth, never assumed from the loop stopping.",
+      "`Channel.send(sender, recipient, payload)` queues a snapshot of an arbitrary payload, and `deliver_all()` delivers everything queued in send order and returns how many messages it delivered.",
+      "`Channel.duplicate_every(k)` queues every k-th send twice and `Channel.drop_every(k)` discards every k-th send; `0` disables each. The channel never invents or reorders a message.",
+      "`component_sizes(node_ids, adjacency)` returns the true size of the component each node belongs to.",
+      "In each round every node sends its **full** known vector to each neighbour, and `deliver_all()` runs before the next round begins. The protocol is the only thing that drives the rounds; nothing else advances `now` or resets the channel.",
+      "`run` returns `{\"counts\", \"converged\", \"rounds\"}`, where `rounds` is the number of rounds actually executed. It stops early when a round teaches no node anything new.",
+      "`adjacency` is undirected, so an entry in either direction creates the link, and an id in `adjacency` that is not in `node_ids` is ignored.",
+      "The rounds argument is a ceiling, not a promise: a well-connected graph converges long before it, and `rounds` in the result is what was actually used."
+    ],
+    "examples": [
+      {
+        "code": "net = Channel()\nout = run(net, [\"a\", \"b\"], {\"a\": [\"b\"]}, 5)\nprint(out[\"counts\"], out[\"rounds\"])",
+        "output": "{'a': 2, 'b': 2} 2",
+        "explanation": "One hop needs one round to carry the claim and a second to show that nothing else arrived."
+      },
+      {
+        "code": "ids = [\"s\", \"a\", \"b\", \"c\", \"t\"]\nadj = {\"s\": [\"a\", \"b\"], \"a\": [\"c\"], \"b\": [\"c\"], \"c\": [\"t\"]}\nout = run(Channel(), ids, adj, 4)\nprint(out[\"converged\"], out[\"rounds\"])",
+        "output": "True 4",
+        "explanation": "The branch is three hops from s to t, so three rounds carry the news and the fourth only confirms the cluster has stopped changing."
+      },
+      {
+        "code": "out = run(Channel(), [\"a\", \"b\", \"x\", \"y\"], {\"a\": [\"b\"], \"x\": [\"y\"]}, 6)\nprint(sorted(out[\"counts\"].values()), out[\"converged\"])",
+        "output": "[2, 2, 2, 2] True",
+        "explanation": "Two components of two nodes each settle on two. Every node is converged and none of them has ever heard of the other component."
+      }
+    ],
+    "approach": "Start with the rule that makes or breaks the problem: a node's answer is a count of the ids in the union it holds, and never the size of the cluster it was told about. Merge is a union per key, so a duplicated message costs nothing and arrival order does not matter. Then decide what `count()` reads. Walking `known` on every call is O(V) per call and O(V^2) per round across the cluster for no information, because merge already knows exactly how many ids arrived; keep the union as its own set, add only the ids that were not already there, and `count()` becomes a set length. The next decision is when to stop. Comparing the total ids learned before and after a round is enough, because a node only ever grows, and it avoids diffing every vector. Be clear that stopping early and being right are different facts, which is why `converged` is computed from `component_sizes` instead of inferred from the loop exiting. On the channel, queue a snapshot rather than the sender's live sets, or a claim can mutate after it was sent and the link delivers something no node said.",
+    "interface": [
+      "Node(node_id)",
+      "Node.merge(payload)",
+      "Node.count()",
+      "Node.converged(truth)",
+      "Channel.send(sender, recipient, payload)",
+      "Channel.deliver_all()",
+      "Channel.duplicate_every(k)",
+      "Channel.drop_every(k)",
+      "component_sizes(node_ids, adjacency)",
+      "run(net, node_ids, adjacency, rounds)"
+    ],
+    "note": "The classic wrong answer is a node that falls back to the number of ids in the cluster, or asks around until somebody gives it a number. In a partitioned cluster that turns a correct 2 into a 4. A node may only ever report what it can derive from its own union, which is why the ground truth lives in `component_sizes` and not inside the protocol."
+  },
+  "nodes:followup": {
+    "overview": "Full-set gossip gets the right answer and pays for it on every single round: every message carries the whole membership vector, so a settled id is re-sent forever. This stage keeps the same round count and sends only what moved.",
+    "task": "Implement `gossip(node_ids, adjacency, phases) -> dict`.",
+    "requirements": [
+      "Every node stamps each id with the phase it first heard of it, phase 0 for its own id.",
+      "In phase k, a node sends the ids stamped with phase k-1 to each neighbour and nothing else. An id a node already holds is never re-sent in a later phase.",
+      "An id that arrives twice keeps the first stamp it was given, which is what keeps the delta a node emits later correct.",
+      "`adjacency` is undirected, and an id outside `node_ids` is ignored.",
+      "The result is `{\"counts\", \"converged\", \"sent\"}`, where `sent` is the total number of ids transmitted across links.",
+      "`converged` compares every count with that node's true component size, so a partition makes the run report non-convergence rather than a wrong number.",
+      "`phases` of 0 sends nothing and leaves every node knowing only itself."
+    ],
+    "examples": [
+      {
+        "code": "adj = {\"a\": [\"b\"], \"b\": [\"a\", \"c\"], \"c\": [\"b\", \"d\"], \"d\": [\"c\"]}\nout = gossip([\"a\", \"b\", \"c\", \"d\"], adj, 3)\nprint(out[\"counts\"][\"a\"], out[\"counts\"][\"d\"], out[\"converged\"])",
+        "output": "4 4 True",
+        "explanation": "The path is three hops long, so three phases carry the far ends' ids all the way across and every node agrees on four."
+      },
+      {
+        "code": "adj = {\"a\": [\"b\"], \"b\": [\"a\", \"c\"], \"c\": [\"b\", \"d\"], \"d\": [\"c\"]}\nout = gossip([\"a\", \"b\", \"c\", \"d\"], adj, 2)\nprint(out[\"counts\"])",
+        "output": "{'a': 3, 'b': 4, 'c': 4, 'd': 3}",
+        "explanation": "Two phases is one hop short of the ends, so the middle agrees and the ends report what they have actually heard."
+      },
+      {
+        "code": "print(gossip([\"solo\"], {}, 3))",
+        "output": "{'counts': {'solo': 1}, 'converged': True, 'sent': 0}",
+        "explanation": "A node with no links transmits nothing and is trivially correct."
+      }
+    ],
+    "approach": "Give every id a stamp: the phase in which this node first heard of it. That single decision answers both questions the protocol asks. What to send is everything stamped with the previous phase, which is why the stamp has to be taken from the state at the start of the phase rather than read while delivering: an id learned during phase k must not be forwarded in phase k or the delta grows with the cluster instead of shrinking. The stamp also decides when an id stops travelling: once it is older than k-1 it is never sent again, so a node's traffic is bounded by the ids it genuinely did not hold before. Take the first stamp you ever saw for an id and never overwrite it, otherwise a re-advertised id looks freshly learned and is transmitted forever. Cut the delta before you send rather than after, and count the ids you hand to a link, not the messages, because that is the quantity the byte argument is about.",
+    "interface": ["gossip(node_ids, adjacency, phases)"],
+    "note": "Keep the first stamp. Rewriting it on redelivery looks harmless and turns the delta into the full vector again, because an id re-advertised every phase is stamped with every phase."
+  },
+  "resumable": {
+    "overview": "A stream you cannot rewind is a stream you cannot retry. Build a cursor over any source that can say where it is and be put back there, without ever holding the stream in memory, and then compose cursors so a derived stream still means the same thing as the one underneath it.",
+    "task": "Implement `Resumable`, three combinators over it, and a JSON object source that survives chunk boundaries.",
+    "requirements": [
+      "`Resumable(source)` wraps a zero-argument callable returning a fresh iterator, or a container that can be iterated more than once. A bare one-shot generator cannot be a source, because there is no way back to its start.",
+      "`next(n)` with `n >= 1` pulls exactly `n` items and returns the last, or `-1` if fewer than `n` remain, having consumed the remainder.",
+      "The source is never materialised. Constructing the iterator produces nothing, and a `next` call pulls nothing beyond the items it returns.",
+      "`snapshot()` is an `int`: how many items have been taken from the source. `restore(pos)` runs the source again and discards items until `pos` items have been taken.",
+      "Restoring a position past the end is not an error: the stream is left exhausted and `next` answers `-1` from then on. It costs time proportional to the position, and no buffering.",
+      "`chain(a, b)`, `filtered(pred, source)` and `taken(n, source)` each return a new `Resumable` over the underlying source. A derived stream snapshots the position its source does, and restoring it replays the source and re-applies the predicate.",
+      "The position counts source items taken, not items handed out, so a filtered stream advances past the items it rejects and its snapshot stays comparable with its source's.",
+      "`taken(n, source)` stops after exactly `n` pulls, so its position never runs ahead of `n` and it does not reach for one more item to discover the stream has ended.",
+      "`JsonObjects(chunks)` is a re-iterable source of the JSON objects in a `str` or `bytes` stream. Objects straddle chunk boundaries, and braces, backslashes and escaped quotes inside strings are data rather than structure."
+    ],
+    "examples": [
+      {
+        "code": "r = Resumable(range(1, 6))\nprint(r.next(2))\nposition = r.snapshot()\nprint(r.next(2))\nr.restore(position)\nprint(r.next(2))\nprint(r.next(1))\nprint(r.next(1))",
+        "output": "2\n4\n4\n5\n-1",
+        "explanation": "The snapshot counts source items taken, so it is 2 after the first call. Restoring it makes the stream replay 3 and 4 rather than continue from 5, and only the sixth call runs out and returns -1."
+      },
+      {
+        "code": "made = [0]\ndef source():\n    for i in range(100):\n        made[0] += 1\n        yield i\n\nr = Resumable(source)\nprint(made[0])\nprint(r.next(1))\nprint(made[0])",
+        "output": "0\n0\n1",
+        "explanation": "Wrapping the generator produces nothing at all, and one call to next pulls one item. A solution that listed the source up front would print 100 here."
+      },
+      {
+        "code": "text = '{\"a\": 1, \"t\": \"x}y\"} {\"b\": {\"c\": [1, 2]}}'\nchunks = [text[i:i + 3] for i in range(0, len(text), 3)]\nprint(list(JsonObjects(chunks)))\nstream = Resumable(JsonObjects(chunks))\nprint(stream.next(1))",
+        "output": "[{'a': 1, 't': 'x}y'}, {'b': {'c': [1, 2]}}]\n{'a': 1, 't': 'x}y'}",
+        "explanation": "Three-character chunks split the first object in the middle of its string, where a brace sits. Tracking string and escape state separately from brace depth keeps it together."
+      }
+    ],
+    "approach": "Decide what a position is before writing anything else, because everything else follows from it. A position counts items taken from the source, not items handed out, and that is the only choice that survives composition: with a filter in play the two differ, and a caller cannot reconstruct an emitted-stream position without knowing which items were rejected. Because the position is a count, restore does not need the old output, only the source, so it re-runs the source and throws the first pos items away. That is why the source cannot be a one-shot generator: a generator cannot be rewound, so the only options are to buffer everything it produced, which is the memory you were avoiding, or to require a factory that can run again. Give each combinator a source and rebuild the whole pipeline on restore, so the predicate is replayed rather than skipped, and so `filtered` never has to know how many items its own caller already saw. For the JSON source, keep a buffer, a scan position, a brace depth and two flags for string and escape state, all persisting across chunks; carry the scan position rather than rescanning, and trim the buffer when depth returns to zero so it stays proportional to the object being read.",
+    "note": "A position counts source items taken, not items emitted. A filtered stream pulls and rejects items and still advances, so after emitting 2 from range(1, 11) its snapshot is 2, and after emitting 6 it is 6 rather than 3. Restore re-applies the filter from that same source position, which is why the filter is part of what a position means."
+  },
+  "resumable:followup": {
+    "overview": "Replaying a source from the start is correct and expensive. This stage replaces it with a bounded window of the recent tail, and makes the limit part of the contract: a position older than the window cannot be honoured, and saying so is better than silently resuming from the wrong place.",
+    "task": "Build a log of items whose recent tail can be replayed in memory, with a position that stops being valid at a known point.",
+    "requirements": [
+      "`ReplayLog(window)` keeps an append-only log of items. Only the last `window` items are held in memory; older ones are dropped but still counted.",
+      "`append(item)` records one item. `next(n)` with `n >= 1` consumes `n` items and returns the last, or `-1` once the rest is consumed.",
+      "`snapshot()` is an `int` position in the whole log, including items that have been dropped.",
+      "`restore(token)` moves the cursor to `token` and raises `ValueError` when the item at that position has already fallen out of the window.",
+      "`replay(token)` returns the items from `token` to the end of the log as a list and does not move the cursor. It raises `ValueError` on the same condition as `restore`.",
+      "`spilled()` reports how many items have fallen out of memory. A reader that falls more than `window` items behind has lost the head of the log.",
+      "`window >= 1`, and the log may be empty, in which case `next` returns `-1` and `replay` returns an empty list."
+    ],
+    "examples": [
+      {
+        "code": "log = ReplayLog(3)\nlog.append(1)\nprint(log.next(1))\nlog.append(2)\nlog.append(3)\nlog.append(4)\nposition = log.snapshot()\nprint(log.next(2))\nprint(log.spilled())\nlog.restore(position)\nprint(log.replay(position))",
+        "output": "1\n3\n1\n[2, 3, 4]",
+        "explanation": "After four appends only the last three are still held, so one has spilled. The position survives because the item it names is still in memory, and replay reads past it without moving the cursor."
+      },
+      {
+        "code": "log = ReplayLog(3)\nfor item in [1, 2, 3]:\n    log.append(item)\nlog.next(1)\nstale = log.snapshot()\nfor item in [4, 5, 6]:\n    log.append(item)\nprint(log.spilled())\ntry:\n    log.restore(stale)\nexcept ValueError as error:\n    print(type(error).__name__)",
+        "output": "3\nValueError",
+        "explanation": "The token pointed at the second item, which the window has now dropped. Raising is the honest answer, since the item is not anywhere to be found."
+      }
+    ],
+    "approach": "Keep two things with different lifetimes: a tail of the last window items, and a total count of everything ever appended. A position is an index into the whole log, and the total is what turns that index into an offset into the tail, so a position stays an integer and never has to carry the item it names. The invariant to write down first is that the cursor may fall at most window behind the tail: inside that band reading and restoring both work, and outside it the item is gone, so restore and replay raise instead of returning something plausible. Refusing loudly matters more here than in the base problem, because a reader that silently jumped to the oldest surviving item would process a gap as if it were data. The window size comes from how long a reader can stall before a checkpoint is worthless, and the signal to revisit it is a restore that raises in production, which means a consumer stalled or the window is too small.",
+    "interface": [
+      "ReplayLog(window)",
+      "ReplayLog.append(item)",
+      "ReplayLog.next(n)",
+      "ReplayLog.snapshot()",
+      "ReplayLog.restore(token)",
+      "ReplayLog.replay(token)",
+      "ReplayLog.spilled()"
+    ],
+    "note": "A position is an index into the whole log, not an offset into the window. Once the item at that index falls out of the window there is nothing to resume from, and the honest answer is to raise rather than to resume from the oldest item that happens to still be there."
+  },
+  "persist": {
+    "overview": "State that survives a restart is a format before it is a data structure. Define the bytes on disk, make the reader able to read an older version of them, and only then decide how the log that holds them behaves when a write is cut off halfway.",
+    "task": "Implement `RecordCodec` for the format and a `Journal` that replays an append-only log to rebuild the state.",
+    "requirements": [
+      "`RecordCodec.encode(state)` writes a dict of string keys to JSON values as one line prefixed with the schema version, and `decode(text)` reads it back, upgrading an older version on the way.",
+      "A missing key and a key holding `None`, `\"\"`, `0` or `False` are different states. All four survive a round trip unchanged, and the encoded text is canonical, so two equal states encode to the same bytes.",
+      "`Journal(codec=None)` keeps an append-only log in `self.log`, a list of raw lines. `append(key, value, now)` and `remove(key, now)` each write one line, and `append_raw(text)` writes text exactly as given.",
+      "Each entry is a record dict with keys `key`, `value`, `deleted` and `at`. `load(now)` replays the log with the last write for a key winning, a tombstone deleting the key, and anything stamped later than `now` ignored. Stamps are nondecreasing.",
+      "A tombstone is a record rather than an absence, which is what lets a delete survive being replayed from an older prefix of the log.",
+      "A final line with no terminating newline is a write a crash cut off and is dropped. Any other line that does not decode raises `ValueError`.",
+      "`snapshot(now)` returns `{\"at\": int, \"now\": int, \"data\": str}`, the compacted state of the entries visible at `now`. `at` counts the records folded in, and because stamps never decrease those records are a prefix of the log, so that count is a position rather than a guess.",
+      "`restore(snapshot, now)` trusts that prefix, replays only the entries after it, and raises `ValueError` when `now` is earlier than `snapshot[\"now\"]`. It does not compact the log.",
+      "Every timestamp arrives as an argument. The wall clock is never read, so the same sequence of calls always gives the same result."
+    ],
+    "examples": [
+      {
+        "code": "c = RecordCodec()\nstate = {\"none\": None, \"empty\": \"\", \"zero\": 0, \"off\": False}\nprint(c.encode(state))\nprint(c.decode(c.encode(state)) == state)\nprint(\"none\" in c.decode(c.encode({\"none\": None})))",
+        "output": "v2 {\"empty\": \"\", \"none\": null, \"off\": false, \"zero\": 0}\nTrue\nTrue",
+        "explanation": "Keys are sorted so equal states produce identical text. The key holding null is present after the round trip, which is what separates it from a key that was never written."
+      },
+      {
+        "code": "j = Journal()\nj.append(\"a\", 1, now=0)\nj.append(\"a\", 2, now=1)\nj.remove(\"a\", now=2)\nj.append(\"b\", None, now=3)\nprint(j.load(10))\nprint(j.load(2))",
+        "output": "{'b': None}\n{}",
+        "explanation": "At time 10 the tombstone has been applied and the later record is visible, so only b is left. At time 2 the record stamped at 3 has not happened yet, so a was already deleted."
+      },
+      {
+        "code": "j = Journal()\nj.append(\"a\", 1, now=0)\nsnapshot = j.snapshot(0)\nj.append(\"a\", 2, now=1)\nprint(j.restore(snapshot, 10))\nprint(j.load(10))",
+        "output": "{'a': 2}\n{'a': 2}",
+        "explanation": "The snapshot covers the first record and says how many records it folded in. Restoring believes it and replays only what came after, which lands on the same state as a full replay."
+      }
+    ],
+    "approach": "Write the encoder and the decoder before the journal, and let the journal write records through the encoder rather than building strings of its own, so there is exactly one place where the format exists. Two decisions drive the rest. First, encode the whole state rather than the interesting keys: dropping falsy values is the tempting optimisation and it destroys the difference between a key that is absent and a key holding null, which no later code can recover. Sorted keys are worth it on their own, because two equal states then encode to identical bytes and a checksum or a diff has something stable to work on. Second, a version in the text turns \"the format changed\" from a migration weekend into one function per step, and reading a version newer than this code knows is an error rather than a best guess. For the journal, decide the torn-write rule from where the damage can happen: only the last write can be interrupted, so an unterminated final line is dropped and any other bad line is corruption worth refusing. Tombstones are records, not absences, or a delete disappears when the log is replayed from an older prefix. Timestamps come in as arguments throughout, which is what lets a test move time forward by hand and lets a snapshot be replayed at a different time than it was taken.",
+    "note": "A key holding null and a key that is missing are different states, and so are \"\", 0 and False. Encode the whole state: anything you leave out is a distinction the format can no longer make. Timestamps are arguments, never a clock, so load(2) and load(10) can differ for the same log."
+  },
+  "persist:followup": {
+    "overview": "A newline only tells you a write finished. A checksum tells you the bytes are still the bytes that were written, which moves a different class of damage, corruption in place, from invisible to refused.",
+    "task": "Frame every record with its own checksum, then make compaction survivable by turning a position into an identity instead of a count of lines.",
+    "requirements": [
+      "`RecordCodec` is unchanged. A log written by either version still reads, and the checksum is computed over the payload `encode` produces.",
+      "Each log line is 8 hex digits of crc32 of the payload, a space, the payload, and a newline. `self.log` is the list of raw lines, and `frame(record)` returns that line for one record.",
+      "A record is a dict with keys `key`, `value`, `deleted`, `at` and `seq`. The journal assigns `seq`, one per appended record, increasing by one and never reused.",
+      "`append(key, value, now)` and `remove(key, now)` write one framed record each. `load(now)` replays with the last write winning and a tombstone deleting the key.",
+      "`load(now)` raises `ValueError` when a line does not match its checksum, when a line has no terminating newline, or when a version cannot be read. Unlike the base journal, a torn tail is refused rather than dropped.",
+      "`snapshot(now)` returns `{\"seq\": int, \"now\": int, \"data\": str}`, where `seq` is the sequence of the last record folded in. A record stamped later than `now` is left for later rather than skipped, so an earlier snapshot still picks it up when it is restored at a later time.",
+      "`restore(snapshot, now)` starts from `data` and replays only the records whose `seq` is greater, and raises `ValueError` when `now` is earlier than `snapshot[\"now\"]`. The snapshot is believed rather than checked, which is what lets the log be rewritten underneath it.",
+      "`compact(snapshot, now)` rewrites the log as one line beginning `state ` whose payload is the codec text of `{\"seq\": ..., \"state\": ...}`, followed by the framed records whose `seq` is greater, and returns `load(now)`. It removes the history at or below that sequence, so a snapshot older than the compaction cannot be restored."
+    ],
+    "examples": [
+      {
+        "code": "j = CheckedJournal()\nj.append(\"a\", 1, now=0)\nj.append(\"b\", 2, now=1)\nprint(j.load(5))\nsnapshot = j.snapshot(1)\nj.remove(\"a\", now=2)\nprint(j.restore(snapshot, 5))\nprint(j.load(5))",
+        "output": "{'a': 1, 'b': 2}\n{'b': 2}\n{'b': 2}",
+        "explanation": "The snapshot covers both records and names the last sequence it folded in. Restoring starts from that state and replays only the tombstone that came after, matching what a full replay gives."
+      },
+      {
+        "code": "j = CheckedJournal()\nj.append(\"a\", 1, now=0)\nj.log[0] = j.log[0].replace('\"a\"', '\"z\"')\ntry:\n    print(j.load(5))\nexcept ValueError as error:\n    print(type(error).__name__)",
+        "output": "ValueError",
+        "explanation": "The payload changed but the checksum in front of it did not, so the line is refused. The base journal would have replayed the altered record without noticing."
+      },
+      {
+        "code": "j = CheckedJournal()\nfor value in range(6):\n    j.append(\"k\" + str(value), value, now=value)\nbefore = j.load(10)\nsnapshot = j.snapshot(2)\nprint(len(j.log))\nprint(j.compact(snapshot, 10) == before)\nprint(len(j.log))\nprint(j.load(10) == before)",
+        "output": "6\nTrue\n4\nTrue",
+        "explanation": "Six records become a state line plus the three the snapshot does not cover, and the state is unchanged. The saved snapshot still points at the same data afterwards."
+      }
+    ],
+    "approach": "Put the checksum in front of the payload and split the line on the first space, so the reader never has to trust a length it computed from the data it is checking. That buys two refusals instead of one: a payload that does not match its checksum, and a line with no newline at all. Refusing the torn tail is the judgement call worth arguing for. The base journal dropped it because an unterminated line was the only visible sign of an interrupted write; once every line carries a digest, an unterminated line is still just an unterminated line, and silently dropping it is how a log loses the write you most wanted to keep. Cover the version inside the payload so the checksum covers it too, otherwise a downgrade passes the check. The bigger change is the position. The base problem counted lines, which is fine until compaction rewrites the log and the count stops pointing where it did. Number every record as it is appended and let the snapshot carry the sequence of the last record folded in, then a position names a record rather than a place in a file, and compaction can replace the prefix with one state line without invalidating anyone at or after it. Say plainly what compaction still costs: the history below the sequence is gone, so compact towards a snapshot you intend to keep rather than the newest one every time.",
+    "interface": [
+      "CheckedJournal(codec=None)",
+      "CheckedJournal.frame(record)",
+      "CheckedJournal.append(key, value, now)",
+      "CheckedJournal.remove(key, now)",
+      "CheckedJournal.load(now)",
+      "CheckedJournal.snapshot(now)",
+      "CheckedJournal.restore(snapshot, now)",
+      "CheckedJournal.compact(snapshot, now)"
+    ],
+    "note": "A checksum covers the bytes, not the intent. It catches a record that was damaged after it was written; it cannot tell you a record is missing, only that what is there is what was written. And a torn tail is now refused rather than dropped, because a line nobody can vouch for is not a record."
+  },
+  "sheet": {
+    "overview": "A spreadsheet is only trustworthy if the arithmetic under it is right, so start with the language: one pass to turn text into tokens, a recursive descent parser, and an evaluator that refuses rather than guesses. What a write invalidates is the next stage, and being precise about what this stage cannot do is what makes that stage obvious.",
+    "task": "Implement `Sheet` with `get`, `set` and `evaluate`, over cell references, literals, the four operators and the five aggregate functions.",
+    "requirements": [
+      "A cell is letters then digits: `A1`, `B2`, `AA10`. Rows start at 1, so `A0` is rejected, and a name like `nonsense` is not a cell at all.",
+      "`set` takes a number or a string starting with `=`. Any other value, including a `bool`, a list or a plain string, raises `ValueError` and changes nothing.",
+      "Formulas allow cell references, integer and float literals, `+ - * /`, parentheses, unary minus, and `SUM`, `MIN`, `MAX`, `AVG`, `COUNT` over ranges like `A1:B4` or lists like `SUM(A1:B2,D1:D2)`. Precedence is the usual one and unary minus binds tighter than `*` and `/`, so `=-A1+4` is `4 - A1`.",
+      "A function argument is a cell or a range. An unknown name, a trailing token such as `=2 3`, an unbalanced bracket and `SUM(A1*2)` all raise `ValueError` rather than being quietly reinterpreted.",
+      "A reversed range such as `B2:A1` raises `ValueError`. The ends are never silently swapped, and a range with only one end, such as `=A1:`, is refused too.",
+      "Whitespace between tokens is ignored, but nothing else is: a character the grammar does not recognise is an error rather than something to skip.",
+      "`get` on a cell that was never set returns `0`, and an unset cell reads as `0` inside a formula too, so `COUNT(A1:B2)` on a fresh sheet is 4 and `SUM(A1:B2)` is 0.",
+      "Division by zero yields the string `\"error\"`. Any formula that reads an error cell yields `\"error\"` as well, including a function whose range contains one.",
+      "Nothing is recomputed. A write is one evaluation against the values as they stand, so a formula that reads its own cell sees the value that cell held before the write, and a cell written afterwards leaves the cells that read it alone. Tracking what depends on what is the next stage.",
+      "`evaluate(formula)` runs one formula against current values, stores nothing, and needs the leading `=`.",
+      "The parser records every reference it sees while it parses, so the dependency list for a formula is a by-product of the parse rather than a second pass over the text."
+    ],
+    "examples": [
+      {
+        "code": "s = Sheet()\ns.set(\"A1\", 2)\ns.set(\"A2\", 3)\ns.set(\"B1\", \"=(A1 + A2) * 10\")\ns.set(\"C1\", \"=-A1 + 4\")\ns.set(\"D1\", \"=2 + 3 * 4\")\nprint(s.get(\"B1\"))\nprint(s.get(\"C1\"))\nprint(s.get(\"D1\"))",
+        "output": "50\n2\n14",
+        "explanation": "Precedence and nesting come from the grammar, and unary minus binds tighter than multiplication so it applies to A1 alone."
+      },
+      {
+        "code": "s = Sheet()\ns.set(\"A1\", 1)\ns.set(\"A2\", 2)\ns.set(\"B1\", 3)\ns.set(\"B2\", 4)\ns.set(\"AA1\", 10)\ns.set(\"AB1\", 20)\ns.set(\"C1\", \"=SUM(A1:B2)\")\ns.set(\"C2\", \"=AVG(A1:B2, AA1:AB1)\")\nprint(s.get(\"C1\"))\nprint(s.get(\"C2\"))\nprint(s.evaluate(\"=COUNT(A1:B2)\"))",
+        "output": "10\n6.666666666666667\n4",
+        "explanation": "A multi-letter column is just base 26 with a 1-based digit, so AA1 is column 27, and AVG over six values divides once."
+      },
+      {
+        "code": "s = Sheet()\ns.set(\"A1\", 3)\ns.set(\"B1\", \"=A1 * 10\")\nprint(s.get(\"B1\"))\ns.set(\"A1\", 7)\nprint(s.get(\"B1\"))\ns.set(\"B1\", \"=B1 + 1\")\nprint(s.get(\"B1\"))",
+        "output": "30\n30\n31",
+        "explanation": "One write is one evaluation against the values as they stand, so B1 keeps its 30 when A1 changes. Knowing what depends on what is the next stage. Rewriting B1 reads the 30 it already held, which is why the last line is 31 and not 1."
+      },
+      {
+        "code": "s = Sheet()\ns.set(\"A1\", 1)\ns.set(\"B1\", \"=A1 / 0\")\nprint(s.get(\"B1\"))\ns.set(\"C1\", \"=COUNT(A1:B1)\")\nprint(s.get(\"C1\"))\ntry:\n    s.set(\"D1\", \"=SUM(A1:A2\")\nexcept ValueError:\n    print(\"refused\")\nprint(s.get(\"D1\"))",
+        "output": "error\nerror\nrefused\n0",
+        "explanation": "Division by zero is a value, not an exception, and it poisons every formula that reads it, a function over its range included. A malformed formula is a different thing entirely: it is refused, and the cell it named keeps the value it had."
+      }
+    ],
+    "approach": "Tokenize in one pass, deciding at each character whether it starts an operator, a number, a cell reference or a function name, and raise there rather than later: a character you decide to ignore becomes a number you are confident about. If the tokenizer finds matches by pattern rather than by walking the string, compare the matches back against the source, because the pattern skips what it cannot match and a silent skip is the same failure by another route. Then parse by recursive descent, one method per precedence level, so `2 + 3 * 4` cannot come out as 20 and `-A1` binds to A1 alone. Keep every cell as a (row, column) pair rather than as its text: a pair compares, so the ends of a range decide its order and a reversed range is caught with one comparison, and expanding `A1:B4` into cells becomes arithmetic instead of string work. Evaluate as you parse the value in, and judge division before you divide so the error is a value every reader can see. Nothing here caches or recomputes, and that is deliberate rather than lazy: one write is one evaluation, and a stage that pretends to know about dependencies without a graph teaches the candidate to guess at them. Recording the references during the parse is the one piece of foresight worth making now, because it is free at this stage and it is exactly what the next stage needs.",
+    "note": "Two traps hide here. First, a reversed range: `B2:A1` has to raise rather than swap its ends, because swapping invents a range nobody asked for and quietly returns a number. Second, argument position: if a function argument accepts an expression, then `SUM(A1*2)` becomes a question about something other than what it looks like, so restrict arguments to cells and ranges. Reading an unset cell as `0` everywhere keeps the two consistent with each other: `SUM` over a blank block is 0 and `COUNT` over that same block is the number of cells in it."
+  },
+  "sheet:followup": {
+    "overview": "A total that is quietly stale is worse than one that is briefly wrong, so the next stage is about invalidation: writing one cell must cost what depends on that cell and nothing more. Two maps do it, read in opposite directions, and batching shows where the atomicity argument really has to be made.",
+    "task": "Build `BatchSheet`: the base engine plus a dependency graph, so a write recomputes only its transitive dependents, a cycle is refused, and a batch of writes lands whole or not at all.",
+    "requirements": [
+      "`get`, `set`, `evaluate` and the formula syntax behave exactly as in the base problem: the same `=`, the same operators and functions, the same `\"error\"`, the same `ValueError` for a malformed formula or a reversed range.",
+      "`set(cell, value)` is one write and returns the cell's new value. `set_many(changes)` applies a whole dict of writes and returns the number of formula cells it evaluated.",
+      "A write recomputes only the transitive dependents of the cell it wrote, and only those. `recomputations` counts formula evaluations, and both `set` and `set_many` move it.",
+      "A cell that was never written reads as `0`, exactly as in the base.",
+      "A write that would create a cycle, including a cell reading itself, raises `ValueError` and leaves every value and the counter untouched.",
+      "`set_many` parses the whole batch and proves it acyclic before anything lands, so a `ValueError` leaves the sheet exactly as it was. Two writes that only close a cycle together, such as `{\"A1\": \"=A2\", \"A2\": \"=A1\"}`, are still rejected.",
+      "A cell that several writes reach is evaluated exactly once, however many times it appears in the dirty set.",
+      "`order(changes)` returns the same dirty cells, as addresses such as `\"B1\"`, in an order where every cell comes after the cells it reads. It writes nothing and does not move `recomputations`.",
+      "A constant written in the batch still invalidates its dependents; a formula cell written in the batch is itself dirty and is evaluated in that same pass.",
+      "An error cell is still a dirty cell: it stays in the plan and is re-evaluated when its input is repaired."
+    ],
+    "examples": [
+      {
+        "code": "b = BatchSheet()\nb.set(\"A1\", 1)\nb.set(\"A2\", 10)\nb.set(\"B1\", \"=A1 * 2\")\nb.set(\"C1\", \"=B1 + A2\")\nb.set(\"D1\", \"=100\")\nbefore = b.recomputations\nb.set(\"A1\", 5)\nprint(b.recomputations - before)\nprint(b.get(\"C1\"))\nprint(b.get(\"D1\"))",
+        "output": "2\n20\n100",
+        "explanation": "Only B1 and C1 depend on A1, so exactly two evaluations happen and D1 keeps its value. That is the whole point of the graph: the cost of a write is what depends on it."
+      },
+      {
+        "code": "b = BatchSheet()\nprint(b.set_many({\"A1\": 1, \"B1\": \"=A1 * 2\", \"C1\": \"=B1 + 1\"}))\nprint(b.get(\"C1\"))",
+        "output": "2\n3",
+        "explanation": "Three writes land together. B1 and C1 both carry new formulas, so both are dirty and both are evaluated, each exactly once."
+      },
+      {
+        "code": "b = BatchSheet()\nb.set_many({\"A1\": 1, \"B1\": \"=A1 * 2\", \"C1\": \"=A1 * 10\", \"D1\": \"=B1 + C1\"})\nbefore = b.recomputations\nprint(b.set_many({\"A1\": 2}))\nprint(b.get(\"D1\"))\nprint(b.recomputations - before)",
+        "output": "3\n24\n3",
+        "explanation": "D1 reads two cells that both changed. Recomputing it once per input would be two evaluations and one wasted answer."
+      },
+      {
+        "code": "b = BatchSheet()\nb.set(\"A1\", 1)\nb.set(\"B1\", \"=A1 / 0\")\ntry:\n    b.set(\"A1\", \"=B1 + 1\")\nexcept ValueError:\n    print(\"rejected\")\nprint(b.get(\"A1\"))\nprint(b.get(\"B1\"))\nprint(b.order({\"A1\": 5}))",
+        "output": "rejected\n1\nerror\n['B1']",
+        "explanation": "The refused write would have closed a loop through B1, so the sheet is left exactly as it was, error cell included. order answers the same question without writing: only B1 depends on A1."
+      }
+    ],
+    "approach": "Keep two maps and no more: what each formula reads, and who reads each cell. One is the other turned round, so storing both is a cache rather than a second source of truth, and the same two maps answer two questions in opposite directions. On a write, replace the edges leaving the cell being written and walk its dependents depth-first, appending each cell as the walk finishes it, then reverse that list. Reverse finish order is the topological order, and the reversal is the part that matters: handing the list over unreversed publishes a total before the formula it feeds, which is precisely the stale number nobody forgives. The cycle check reads the same maps the other way round, because a new formula closes a loop exactly when one of the cells it reads already reaches it by reading. Do all of that before touching any state, so the rejection costs nothing. Batching is where atomicity shows up, so split `set_many` into a prepare phase and an apply phase: prepare parses every value and rebuilds the edges on copies of the live maps, then runs the cycle test against those copies, which is what catches a cycle that only exists because two writes were considered together. Once prepare returns, nothing can fail, so apply assigns the new maps wholesale and evaluates the plan. The plan is the same depth-first post-order filtered to formula cells and seeded from every written cell, which gives evaluated-once for free, because a cell is entered once however many paths reached it. Sort the seeds so the plan does not depend on the order the caller happened to write the dict in.",
+    "interface": [
+      "BatchSheet.get(cell)",
+      "BatchSheet.set(cell, value) -> value",
+      "BatchSheet.set_many(changes: dict) -> int",
+      "BatchSheet.order(changes: dict) -> list[str]",
+      "BatchSheet.evaluate(formula)",
+      "BatchSheet.recomputations -> int"
+    ],
+    "note": "The cycle check has to run against the post-batch graph, not the live one. Checking each write on its own misses `{\"A1\": \"=A2\", \"A2\": \"=A1\"}`, where neither entry is a cycle until both are applied, and applying them one at a time would leave the sheet holding the first half of a write that was supposed to be atomic. The other invariant worth writing down is that an error is not a tombstone: an error cell is still a dirty cell, so it stays in the plan and is re-evaluated when its input is repaired."
+  },
+  "sql": {
+    "overview": "A query layer is where a key-value store either becomes usable or becomes a source of wrong answers. The hard part is not finding rows, it is making the answer a function of the data rather than of the order writes happened to arrive in, which means pinning down what a missing value means and where a tie goes.",
+    "task": "Implement `TableStore` with `insert`, `update`, `delete`, `select`, `include_deleted`, `history` and `schema`.",
+    "requirements": [
+      "A row is a dict with an integer `key` column. Values are numbers, strings or `None`, which is what keeps every ordering total.",
+      "`insert` replaces a live key and resurrects a deleted one, so the key space stays one key space. It raises `ValueError` on a missing or non-integer key and on a value of another type.",
+      "`update` merges into a live row and returns it, or returns `None` for a missing or deleted key. A column outside `schema(table)` and any change to `key` raise `ValueError` and write nothing.",
+      "`delete` writes a tombstone: the row leaves every query, `include_deleted` still shows it as `(key, None)`, and `history` lists every version in write order with `None` per delete. Deleting an absent or already deleted key is a no-op.",
+      "`select` filters with `where(row)`, where an absent column reads as `None`. With no `order_by` rows come back in ascending key order, and every returned row is a fresh copy.",
+      "Ordering by a column ranks a missing value first, then numbers before strings, then the value, and breaks ties on ascending key. `desc` reverses the whole finished list, so it is the exact mirror of ascending.",
+      "`limit` keeps the first rows of that order and must be `None` or a nonnegative integer; a negative limit raises `ValueError`.",
+      "`schema(table)` is the sorted union of every column ever seen in that table, and columns are never renamed or dropped."
+    ],
+    "examples": [
+      {
+        "code": "s = TableStore()\ns.insert(\"users\", {\"key\": 3, \"age\": 40})\ns.insert(\"users\", {\"key\": 1, \"age\": 30})\ns.insert(\"users\", {\"key\": 2, \"age\": 25})\nprint(s.select(\"users\", where=lambda r: r[\"age\"] >= 30))\nprint([r[\"key\"] for r in s.select(\"users\")])",
+        "output": "[{'key': 1, 'age': 30}, {'key': 3, 'age': 40}]\n[1, 2, 3]",
+        "explanation": "Insertion order was 3, 1, 2. The default order is by key, not by arrival, and rows come back as copies."
+      },
+      {
+        "code": "s = TableStore()\ns.insert(\"t\", {\"key\": 2, \"score\": 10})\ns.insert(\"t\", {\"key\": 1, \"score\": 10})\ns.insert(\"t\", {\"key\": 3, \"score\": 5})\ns.insert(\"t\", {\"key\": 4})\ns.insert(\"t\", {\"key\": 5, \"score\": None})\nprint([r[\"key\"] for r in s.select(\"t\", order_by=\"score\")])\nprint([r[\"key\"] for r in s.select(\"t\", order_by=\"score\", desc=True)])",
+        "output": "[4, 5, 3, 1, 2]\n[2, 1, 3, 5, 4]",
+        "explanation": "Keys 4 and 5 have no score and sort first; keys 1 and 2 tie at 10 and break on ascending key. Descending is the exact reverse."
+      },
+      {
+        "code": "s = TableStore()\ns.insert(\"t\", {\"key\": 1, \"v\": 10})\ns.insert(\"t\", {\"key\": 2, \"v\": 20})\ns.delete(\"t\", 1)\nprint(s.select(\"t\"))\nprint(s.include_deleted(\"t\"))\ns.insert(\"t\", {\"key\": 1, \"v\": 11})\nprint(s.history(\"t\", 1))",
+        "output": "[{'key': 2, 'v': 20}]\n[(1, None), (2, {'key': 2, 'v': 20})]\n[{'key': 1, 'v': 10}, None, {'key': 1, 'v': 11}]",
+        "explanation": "A delete hides the row without erasing it, and re-inserting the key resurrects it while the earlier versions stay readable."
+      },
+      {
+        "code": "s = TableStore()\ns.insert(\"t\", {\"key\": 1, \"age\": 30})\ns.insert(\"t\", {\"key\": 2, \"score\": 5})\nprint(s.schema(\"t\"))\ntry:\n    s.update(\"t\", 1, {\"rank\": 7})\nexcept ValueError:\n    print(\"rejected\")\nprint(s.select(\"t\"))",
+        "output": "['age', 'key', 'score']\nrejected\n[{'key': 1, 'age': 30}, {'key': 2, 'score': 5}]",
+        "explanation": "The schema is the union over every row, and an update may not invent a column, so a typo cannot quietly become part of the shape."
+      }
+    ],
+    "approach": "Store one record per key, as a row and a deleted flag, rather than removing the key from the map. A delete then costs a flag write and every read path checks that flag, which is what keeps history reconstructable without a second structure to keep in step. Keep a per-table set of every column ever seen, because that set is what turns a typo in `update` into an exception instead of a new column nobody else agrees exists. For ordering, give every column value a rank rather than comparing values directly: a row with no value gets a rank of its own and so never reaches a value comparison, and numbers rank before strings so a mixed column sorts instead of raising on the first pair. Then append the key to that rank, and one sort key gives you missing-first, type ordering, ties broken by key and a stable result in one expression. Finish by reversing the sorted list for `desc` rather than flipping each comparison, so descending is provably the mirror of ascending and the tie rule needs no second statement. Hand back copies of every row, or a result you already hold will change under you after the next update.",
+    "note": "The two judgement calls worth defending explicitly. A missing value sorts before every present value in ascending order, which makes `desc` put the present values first and means `limit` takes real data rather than blanks unless you ask for the opposite; the alternative, sorting blanks last, hides them behind an arbitrary sentinel and makes the first page of a limit-ordered query empty on a sparse column. And re-inserting a deleted key resurrects it rather than failing, because a key space that splits into live and deleted halves is a much harder thing to reason about than a delete that a later write can undo. Either choice is defensible; what matters is that you state it and that the tests hold you to it."
+  },
+  "sql:followup": {
+    "overview": "Aggregates are the first queries where the answer can depend on the order writes arrived in rather than on the data. A single row read cannot betray that, but a group list can, and a counter that disagrees with the rows it counted is worse than a slow query.",
+    "task": "Extend the store with `count`, `group_by` and `group_count`, keeping the base insert, update, delete, select and schema rules unchanged.",
+    "requirements": [
+      "Keys are integers and values are numbers, strings or `None`. `insert` requires the `key` column, `update` rejects a column outside `schema(table)` and any change to `key`, and `delete` writes a tombstone no query can see.",
+      "`select` still returns fresh copies in ascending key order by default, with the same missing-first ordering rule and the same `desc` and `limit` behaviour.",
+      "`count(table, where=None)` counts live rows only. A tombstone is not a row with a missing value, so it is never counted.",
+      "`group_by(table, column, where=None)` returns `(group, rows)` pairs sorted by group, with the `None` group first, and each group's rows in ascending key order. Rows are copies.",
+      "A row with no value for the column, or one that stores `None` there, belongs to the `None` group. It is never dropped from the aggregate.",
+      "`group_count(table, column, where=None)` returns the same groups as `(group, n)` pairs, and the group sizes must add up to the matching `count`.",
+      "The group order must not depend on the order rows were written or the order the predicate kept them."
+    ],
+    "examples": [
+      {
+        "code": "g = GroupedStore()\ng.insert(\"t\", {\"key\": 1, \"team\": \"a\"})\ng.insert(\"t\", {\"key\": 2, \"team\": \"b\"})\ng.insert(\"t\", {\"key\": 3, \"team\": \"a\"})\nprint(g.group_count(\"t\", \"team\"))\nprint([r[\"key\"] for r in g.group_by(\"t\", \"team\")[0][1]])",
+        "output": "[('a', 2), ('b', 1)]\n[1, 3]",
+        "explanation": "Groups come out sorted by group value rather than in the order the first row of each group arrived, and each group is ordered by key."
+      },
+      {
+        "code": "g = GroupedStore()\ng.insert(\"t\", {\"key\": 2, \"pts\": 9})\ng.insert(\"t\", {\"key\": 3, \"team\": \"b\"})\ng.insert(\"t\", {\"key\": 1, \"team\": \"a\"})\nprint(g.group_count(\"t\", \"team\"))\nprint(g.count(\"t\"))",
+        "output": "[(None, 1), ('a', 1), ('b', 1)]\n3",
+        "explanation": "Key 2 has no team and lands in the None group, which sorts first. The three group sizes add up to the count."
+      },
+      {
+        "code": "g = GroupedStore()\ng.insert(\"t\", {\"key\": 1, \"team\": \"a\"})\ng.insert(\"t\", {\"key\": 2, \"team\": \"b\"})\ng.delete(\"t\", 1)\nprint(g.count(\"t\"))\ng.insert(\"t\", {\"key\": 1, \"team\": \"b\"})\nprint(g.group_count(\"t\", \"team\"))\nprint([r[\"key\"] for r in g.group_by(\"t\", \"team\")[0][1]])",
+        "output": "1\n[('b', 2)]\n[1, 2]",
+        "explanation": "The deleted row leaves group a entirely, and re-inserting key 1 with a new team moves it into group b instead of duplicating it."
+      }
+    ],
+    "approach": "Do not build a parallel aggregate structure. Compute the grouping from the live rows on each call and sort the result, which costs one extra sort but removes a whole class of bug where a cached count drifts away from the rows it counted. Reuse the base ordering rank: it already answers \"missing first, numbers before strings\", so a group with no value sorts ahead of every real group and a group list reads the same way a `select` does. Bucket on the raw value, including `None`, so a row with no column lands somewhere defined rather than vanishing from the total. Derive `group_count` from `group_by` rather than counting separately, then assert that the sizes add up to the count, because two counters over the same rows are exactly the pair that will disagree after the first delete or group-value update. Sort inside each group on the key so the rows are reproducible, and return copies so a later update cannot rewrite a result someone is still holding.",
+    "interface": [
+      "insert(table, row)",
+      "update(table, key, changes)",
+      "delete(table, key)",
+      "select(table, where=None, order_by=None, desc=False, limit=None)",
+      "count(table, where=None) -> int",
+      "group_by(table, column, where=None) -> list[tuple]",
+      "group_count(table, column, where=None) -> list[tuple]",
+      "schema(table) -> list[str]"
+    ],
+    "note": "Keep the three ways of being absent strictly separate, because they are the whole difficulty. A row with no value for the group column belongs to the `None` group. A row with the column set to `None` also belongs to the `None` group, which is why the rank function treats them identically. A tombstone belongs to no group at all, so it must be filtered before bucketing rather than turned into a `None` group member: bucket first and a deleted row quietly resurrects itself as a phantom group."
+  }
+}
